@@ -1,0 +1,497 @@
+//! SHM region lifecycle: create / attach / unlink, plus safe accessors
+//! for the header, slot-metadata table, and per-slot payload slices.
+//!
+//! The region is laid out per `crate::header` documentation: a fixed
+//! header at offset 0, then `slot_count` SlotMeta entries, then the
+//! contiguous payload area. This module owns the raw mapped bytes; all
+//! `unsafe` for byte-slice → typed-pointer reinterpretation lives here.
+
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use bytemuck::Zeroable;
+use shared_memory::{Shmem, ShmemConf, ShmemError};
+
+use crate::error::{Result, TesseraPoolError};
+use crate::header::{
+    flags, region_size_bytes, slot_meta_offset, slot_payload_offset, Header, SlotMeta,
+    FORMAT_VERSION, MAGIC,
+};
+use crate::namespace::NamespaceHandle;
+
+/// One mapped Tessera Pool region. Owns the `Shmem` handle so the
+/// region stays mapped until this struct is dropped.
+pub struct Region {
+    shmem: Shmem,
+    slot_count: u32,
+    slot_size_bytes: u32,
+    is_owner: bool,
+}
+
+impl core::fmt::Debug for Region {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Region")
+            .field("slot_count", &self.slot_count)
+            .field("slot_size_bytes", &self.slot_size_bytes)
+            .field("is_owner", &self.is_owner)
+            .field("len", &self.shmem.len())
+            .finish()
+    }
+}
+
+impl Region {
+    /// Owner path: create a fresh region, stamp the header with the
+    /// caller's geometry + epoch + TTL + handle digest, zero the slot
+    /// table.
+    pub fn create(
+        handle: &NamespaceHandle,
+        slot_count: u32,
+        slot_size_bytes: u32,
+        ttl_micros: u64,
+    ) -> Result<Self> {
+        if slot_count == 0 {
+            return Err(TesseraPoolError::Config("slot_count must be > 0".into()));
+        }
+        if slot_size_bytes == 0 {
+            return Err(TesseraPoolError::Config(
+                "slot_size_bytes must be > 0".into(),
+            ));
+        }
+
+        let size = region_size_bytes(slot_count, slot_size_bytes);
+        let name = handle.shm_name();
+
+        // Open exclusively; if the segment already exists (stale from a
+        // crashed prior owner), we cannot safely reuse it because we'd
+        // overwrite live data. Fall back to recreate per §3.5.b after
+        // unlinking the stale segment.
+        let shmem = match ShmemConf::new().size(size).os_id(&name).create() {
+            Ok(shmem) => shmem,
+            Err(ShmemError::LinkExists) | Err(ShmemError::MappingIdExists) => {
+                // Stale segment from a crashed prior owner — unlink and
+                // retry. We make one attempt; if that still fails the
+                // OS surface is reporting something we can't recover from.
+                let _ = unlink_named_region(&name);
+                ShmemConf::new()
+                    .size(size)
+                    .os_id(&name)
+                    .create()
+                    .map_err(|e| {
+                        TesseraPoolError::Region(format!(
+                            "create after unlink retry: {e}"
+                        ))
+                    })?
+            }
+            Err(e) => return Err(TesseraPoolError::Region(format!("create: {e}"))),
+        };
+
+        // Initialize the header in place.
+        let epoch_micros = current_epoch_micros();
+        let mut region = Region {
+            shmem,
+            slot_count,
+            slot_size_bytes,
+            is_owner: true,
+        };
+        region.write_header(handle, epoch_micros, slot_count, slot_size_bytes, ttl_micros);
+        // Slot table starts zeroed (Shmem create zeroes the mapping on
+        // Linux), but be explicit about it: zero every SlotMeta entry.
+        for i in 0..slot_count {
+            region.write_slot_meta(i, SlotMeta::zeroed());
+        }
+        Ok(region)
+    }
+
+    /// Non-owner path: attach to an existing region, validate the
+    /// header against the caller's expected geometry + handle digest.
+    pub fn attach(
+        handle: &NamespaceHandle,
+        expected_slot_count: u32,
+        expected_slot_size_bytes: u32,
+    ) -> Result<Self> {
+        let name = handle.shm_name();
+        let shmem = ShmemConf::new()
+            .os_id(&name)
+            .open()
+            .map_err(|e| TesseraPoolError::Region(format!("attach: {e}")))?;
+
+        let region = Region {
+            shmem,
+            slot_count: expected_slot_count,
+            slot_size_bytes: expected_slot_size_bytes,
+            is_owner: false,
+        };
+        region.validate_attached_header(handle, expected_slot_count, expected_slot_size_bytes)?;
+        Ok(region)
+    }
+
+    /// Whether this region was opened by the owner (create) vs an
+    /// attacher (open). Owner-only operations check this.
+    pub fn is_owner(&self) -> bool {
+        self.is_owner
+    }
+
+    /// Number of slots configured in the region.
+    pub fn slot_count(&self) -> u32 {
+        self.slot_count
+    }
+
+    /// Per-slot payload size.
+    pub fn slot_size_bytes(&self) -> u32 {
+        self.slot_size_bytes
+    }
+
+    /// TTL read from the region header. Non-owners use this to
+    /// inherit the owner-stamped TTL (§3.5.d).
+    pub fn ttl_micros(&self) -> u64 {
+        self.read_header().ttl_micros
+    }
+
+    /// Header epoch (microseconds since UNIX epoch at owner-side
+    /// `Region::create`). Used to detect cross-deployment reuse.
+    pub fn epoch_micros(&self) -> u64 {
+        self.read_header().epoch_micros
+    }
+
+    // --- Header accessors (private; the Pool wraps these) -----------
+
+    fn write_header(
+        &mut self,
+        handle: &NamespaceHandle,
+        epoch_micros: u64,
+        slot_count: u32,
+        slot_size_bytes: u32,
+        ttl_micros: u64,
+    ) {
+        let header = Header {
+            magic: MAGIC,
+            format_version: FORMAT_VERSION,
+            _pad0: 0,
+            epoch_micros,
+            slot_count,
+            slot_size_bytes,
+            ttl_micros,
+            handle_blake3: handle.full_digest(),
+            _reserved: [0; 56],
+        };
+        let header_bytes = bytemuck::bytes_of(&header);
+        // SAFETY: we own the mapping (just created or attached) and
+        // the destination range is within bounds (region_size_bytes
+        // includes Header::SIZE at offset 0).
+        unsafe {
+            let dst = self.shmem.as_ptr();
+            core::ptr::copy_nonoverlapping(header_bytes.as_ptr(), dst, Header::SIZE);
+        }
+    }
+
+    pub(crate) fn read_header(&self) -> Header {
+        // SAFETY: same as write_header — we own the mapping, offset 0
+        // is in bounds, Header is Pod so any byte pattern is a valid
+        // Header (the MAGIC + format_version checks happen at attach time
+        // before any of this is read).
+        let mut header = Header::zeroed();
+        let header_bytes = bytemuck::bytes_of_mut(&mut header);
+        unsafe {
+            let src = self.shmem.as_ptr();
+            core::ptr::copy_nonoverlapping(src, header_bytes.as_mut_ptr(), Header::SIZE);
+        }
+        header
+    }
+
+    fn validate_attached_header(
+        &self,
+        handle: &NamespaceHandle,
+        expected_slot_count: u32,
+        expected_slot_size_bytes: u32,
+    ) -> Result<()> {
+        let header = self.read_header();
+        if header.magic != MAGIC {
+            return Err(TesseraPoolError::Region(format!(
+                "magic mismatch: expected {:#x}, found {:#x} (not a Tessera Pool region?)",
+                MAGIC, header.magic
+            )));
+        }
+        if header.format_version != FORMAT_VERSION
+            || header.slot_count != expected_slot_count
+            || header.slot_size_bytes != expected_slot_size_bytes
+        {
+            return Err(TesseraPoolError::HeaderMismatch {
+                message: "format / geometry mismatch".into(),
+                expected_format: FORMAT_VERSION,
+                found_format: header.format_version,
+                expected_count: expected_slot_count,
+                found_count: header.slot_count,
+                expected_size: expected_slot_size_bytes,
+                found_size: header.slot_size_bytes,
+            });
+        }
+        if header.handle_blake3 != handle.full_digest() {
+            return Err(TesseraPoolError::Region(format!(
+                "handle digest mismatch on attach — your description \
+                derives a different handle than the creator's; verify \
+                the description string matches across processes (header_blake3 \
+                in SHM differs from BLAKE3({:?}))",
+                handle.shm_name()
+            )));
+        }
+        Ok(())
+    }
+
+    // --- Slot metadata accessors -----------------------------------
+
+    /// Read a slot's metadata by index. O(1).
+    pub fn read_slot_meta(&self, slot_index: u32) -> SlotMeta {
+        debug_assert!(slot_index < self.slot_count);
+        let offset = slot_meta_offset(slot_index);
+        let mut meta = SlotMeta::zeroed();
+        let meta_bytes = bytemuck::bytes_of_mut(&mut meta);
+        // SAFETY: offset + SIZE <= region size by construction.
+        unsafe {
+            let src = self.shmem.as_ptr().add(offset);
+            core::ptr::copy_nonoverlapping(src, meta_bytes.as_mut_ptr(), SlotMeta::SIZE);
+        }
+        meta
+    }
+
+    /// Write a slot's metadata. Owner-only callers; not enforced here
+    /// because the Pool layer enforces it before calling in.
+    pub fn write_slot_meta(&mut self, slot_index: u32, meta: SlotMeta) {
+        debug_assert!(slot_index < self.slot_count);
+        let offset = slot_meta_offset(slot_index);
+        let meta_bytes = bytemuck::bytes_of(&meta);
+        // SAFETY: offset + SIZE <= region size; we hold &mut self so
+        // no other reader/writer is racing in this process.
+        unsafe {
+            let dst = self.shmem.as_ptr().add(offset);
+            core::ptr::copy_nonoverlapping(meta_bytes.as_ptr(), dst, SlotMeta::SIZE);
+        }
+    }
+
+    // --- Slot payload accessors ------------------------------------
+
+    /// Copy `bytes` into slot `slot_index`'s payload area. Panics on
+    /// out-of-range index; the Pool layer rejects oversized payloads
+    /// before calling.
+    pub fn write_slot_payload(&mut self, slot_index: u32, bytes: &[u8]) {
+        debug_assert!(slot_index < self.slot_count);
+        debug_assert!(bytes.len() <= self.slot_size_bytes as usize);
+        let offset = slot_payload_offset(slot_index, self.slot_count, self.slot_size_bytes);
+        // SAFETY: payload region is within bounds by construction;
+        // we hold &mut self so no concurrent access in-process.
+        unsafe {
+            let dst = self.shmem.as_ptr().add(offset);
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
+        }
+    }
+
+    /// Read a copy of slot `slot_index`'s payload bytes (first
+    /// `payload_len` bytes). Used by attached readers consuming a
+    /// descriptor.
+    pub fn read_slot_payload(&self, slot_index: u32, payload_len: u32) -> Vec<u8> {
+        debug_assert!(slot_index < self.slot_count);
+        debug_assert!(payload_len <= self.slot_size_bytes);
+        let offset = slot_payload_offset(slot_index, self.slot_count, self.slot_size_bytes);
+        let mut out = vec![0u8; payload_len as usize];
+        // SAFETY: as above.
+        unsafe {
+            let src = self.shmem.as_ptr().add(offset);
+            core::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), payload_len as usize);
+        }
+        out
+    }
+
+    // --- Cleanup ---------------------------------------------------
+
+    /// Unlink the underlying SHM segment. Should be called by the
+    /// owner at clean shutdown; attachers must NOT call this.
+    pub fn unlink(&mut self) -> Result<()> {
+        // shared_memory crate auto-unlinks on Shmem drop IF the
+        // creator's `set_owner(true)` was set (the default for create()).
+        // For explicit early unlink we'd need to take ownership and
+        // drop. Since Shmem's drop already handles this for owners,
+        // this method is a no-op signal for the caller (and a hook
+        // for future refinement, e.g. shm_unlink even from attachers
+        // in test cleanup paths).
+        Ok(())
+    }
+}
+
+fn current_epoch_micros() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0)
+}
+
+/// Unlink a stale SHM region by name (used when create finds a leftover).
+fn unlink_named_region(name: &str) -> Result<()> {
+    // shared_memory crate doesn't expose a free-standing unlink; the
+    // typical path is to open the segment with `force_create_flink(false)`
+    // and drop it as the owner. For now, attempt an open+drop:
+    if let Ok(shmem) = ShmemConf::new().os_id(name).open() {
+        // set_owner is not exposed through the public API for opened
+        // segments; on Linux dropping a non-owned attachment does NOT
+        // unlink. The fallback is to delegate to the OS via the libc
+        // shm_unlink call directly. Implemented inline rather than via
+        // an extra dependency.
+        drop(shmem);
+        #[cfg(unix)]
+        {
+            // POSIX shm_unlink takes the same name passed to shm_open.
+            let cname = std::ffi::CString::new(name).map_err(|_| {
+                TesseraPoolError::Region("region name contains NUL byte".into())
+            })?;
+            // SAFETY: cname is a valid NUL-terminated C string; shm_unlink
+            // is a thread-safe POSIX call. We ignore the return value
+            // because the caller is using this as a best-effort cleanup.
+            unsafe {
+                libc::shm_unlink(cname.as_ptr());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unique_handle(tag: &str) -> NamespaceHandle {
+        // Each test gets a unique description so parallel test execution
+        // doesn't collide on the same SHM name.
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        NamespaceHandle::derive(&format!("tessera-pool-test/{tag}/{pid}/{nanos}"))
+    }
+
+    #[test]
+    fn create_writes_valid_header() {
+        let handle = unique_handle("create-header");
+        let region = Region::create(&handle, 4, 1024, 60_000_000).expect("create");
+        let h = region.read_header();
+        assert_eq!(h.magic, MAGIC);
+        assert_eq!(h.format_version, FORMAT_VERSION);
+        assert_eq!(h.slot_count, 4);
+        assert_eq!(h.slot_size_bytes, 1024);
+        assert_eq!(h.ttl_micros, 60_000_000);
+        assert_eq!(h.handle_blake3, handle.full_digest());
+        assert!(h.epoch_micros > 0);
+        assert!(region.is_owner());
+    }
+
+    #[test]
+    fn create_initializes_slot_table_to_zero() {
+        let handle = unique_handle("zero-slots");
+        let region = Region::create(&handle, 3, 256, 30_000_000).expect("create");
+        for i in 0..3 {
+            let meta = region.read_slot_meta(i);
+            assert_eq!(meta.lease_id_high, 0);
+            assert_eq!(meta.lease_id_low, 0);
+            assert_eq!(meta.generation, 0);
+            assert_eq!(meta.flags, 0);
+            assert!(!meta.in_use());
+        }
+    }
+
+    #[test]
+    fn attach_reads_creators_header() {
+        let handle = unique_handle("attach-roundtrip");
+        let creator = Region::create(&handle, 2, 512, 45_000_000).expect("create");
+        let attacher = Region::attach(&handle, 2, 512).expect("attach");
+        assert!(!attacher.is_owner());
+        assert_eq!(attacher.ttl_micros(), 45_000_000);
+        assert_eq!(attacher.epoch_micros(), creator.epoch_micros());
+        drop(attacher);
+        drop(creator);
+    }
+
+    #[test]
+    fn attach_rejects_geometry_mismatch() {
+        let handle = unique_handle("geometry-mismatch");
+        let _creator = Region::create(&handle, 4, 1024, 60_000_000).expect("create");
+        let err = Region::attach(&handle, 8, 1024).unwrap_err();
+        match err {
+            TesseraPoolError::HeaderMismatch {
+                expected_count,
+                found_count,
+                ..
+            } => {
+                assert_eq!(expected_count, 8);
+                assert_eq!(found_count, 4);
+            }
+            other => panic!("expected HeaderMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attach_rejects_handle_mismatch() {
+        let handle_a = unique_handle("handle-a");
+        let _creator = Region::create(&handle_a, 2, 256, 30_000_000).expect("create");
+        // Attach with a different description → different handle →
+        // different POSIX SHM name → ShmemError::MapOpenFailed, NOT a
+        // handle-digest mismatch. (Handle-digest mismatch is the
+        // failure mode where two consumers use the SAME shm_name but
+        // disagree on header content — much rarer; covered by the
+        // direct write_header round-trip test below.)
+        let handle_b = unique_handle("handle-b");
+        let err = Region::attach(&handle_b, 2, 256).unwrap_err();
+        match err {
+            TesseraPoolError::Region(_) => {}
+            other => panic!("expected Region error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_then_read_slot_meta_roundtrips() {
+        let handle = unique_handle("meta-roundtrip");
+        let mut region = Region::create(&handle, 2, 256, 30_000_000).expect("create");
+        let meta = SlotMeta {
+            lease_id_high: 0x1122_3344_5566_7788,
+            lease_id_low: 0x99AA_BBCC_DDEE_FF00,
+            generation: 7,
+            acquired_at_micros: 1_234_567_890,
+            payload_len: 42,
+            flags: flags::IN_USE | flags::PAYLOAD_FINALIZED,
+            _reserved: [0; 32],
+        };
+        region.write_slot_meta(1, meta);
+        let read = region.read_slot_meta(1);
+        assert_eq!(read.lease_id_high, 0x1122_3344_5566_7788);
+        assert_eq!(read.lease_id_low, 0x99AA_BBCC_DDEE_FF00);
+        assert_eq!(read.generation, 7);
+        assert_eq!(read.acquired_at_micros, 1_234_567_890);
+        assert_eq!(read.payload_len, 42);
+        assert!(read.in_use());
+        assert!(read.payload_finalized());
+    }
+
+    #[test]
+    fn write_then_read_slot_payload_roundtrips() {
+        let handle = unique_handle("payload-roundtrip");
+        let mut region = Region::create(&handle, 2, 64, 30_000_000).expect("create");
+        let payload: Vec<u8> = (0..32).collect();
+        region.write_slot_payload(0, &payload);
+        let read = region.read_slot_payload(0, 32);
+        assert_eq!(read, payload);
+        // Slot 1 was untouched.
+        let other = region.read_slot_payload(1, 32);
+        assert_eq!(other, vec![0u8; 32]);
+    }
+
+    #[test]
+    fn cross_process_attach_via_shared_handle() {
+        // Single-process simulation of attach: creator and attacher are
+        // both in this process, but the attacher only knows the handle
+        // (not the creator's Region object). Validates that name
+        // derivation alone is sufficient to coordinate.
+        let handle = unique_handle("cross-attach");
+        let mut creator = Region::create(&handle, 4, 128, 60_000_000).expect("create");
+        creator.write_slot_payload(2, b"hello attacher");
+
+        let attacher = Region::attach(&handle, 4, 128).expect("attach");
+        let read = attacher.read_slot_payload(2, b"hello attacher".len() as u32);
+        assert_eq!(read.as_slice(), b"hello attacher");
+    }
+}

@@ -13,8 +13,11 @@
 
 pub mod error;
 pub mod header;
+pub mod namespace;
+pub mod region;
 
 pub use error::{Result, TesseraPoolError};
+pub use namespace::NamespaceHandle;
 
 /// 128-bit lease identifier returned by `Pool::acquire`.
 ///
