@@ -1,0 +1,16 @@
+[package]
+name = "tessera-pool"
+description = "Non-lossy lease-backed shared-memory pool primitive (Tessera Pool)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+
+[lib]
+name = "tessera_pool"
+
+[dependencies]
+blake3 = { workspace = true }

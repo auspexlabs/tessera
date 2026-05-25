@@ -1,0 +1,170 @@
+# Tessera
+
+> Open-source multi-process primitives for Python and Rust:
+> **Pool** (lease-backed shared-memory slots), **Ring** (lossy mmap-backed broadcast),
+> **Sink** (atomic-write worker pool over Pool).
+
+A *tessera* is the small tile that fills a slot in a mosaic. Each component
+in this library hands out tesserae — typed slot-tokens — backed by shared
+memory or memory-mapped regions. The result: producer and worker
+processes hand large payloads back and forth without copying through
+serialization layers, and external containers can join the same SHM
+region via shared IPC namespaces.
+
+---
+
+## Why
+
+Most Python multiprocessing primitives optimize for small messages and
+implicit pickling. That model breaks down when you want to:
+
+- Hand 100 MB Arrow batches between producer and worker without two
+  serialization round-trips.
+- Broadcast a stream of telemetry events to several readers
+  simultaneously, where each reader sees its own per-section
+  drop-counter and the writers never block.
+- Coordinate atomic disk writes across a worker pool that shares one SHM
+  region as a zero-copy staging area.
+- Do any of the above across a container boundary (`docker compose`
+  `ipc:` namespaces) without rolling a custom IPC layer.
+
+Tessera packages those three primitives — Pool, Ring, Sink — with thin
+Python facades on top of Rust cores.
+
+## Components
+
+| Crate | PyPI | Lossy? | What it is |
+|---|---|---|---|
+| [`tessera-pool`](crates/tessera-pool/) | [`tessera-pool`](https://pypi.org/project/tessera-pool/) | No | Non-lossy lease-backed shared-memory pool. Fixed slots, single-owner lifecycle, single-writer-lease, timeout reclaim with slot-generation invalidation of stale handles. For transactional large payloads. |
+| [`tessera-ring`](crates/tessera-ring/) | [`tessera-ring`](https://pypi.org/project/tessera-ring/) | Yes | Lossy mmap-backed multi-writer / multi-reader ring buffer. Per-section write cursors with seqlock counters, caller-supplied sections, per-reader local cursors with gap detection. For telemetry-shaped streams. |
+| [`tessera-sink`](crates/tessera-sink/) | [`tessera-sink`](https://pypi.org/project/tessera-sink/) | No | Atomic-write worker pool to disk, built on `tessera-pool` for SHM zero-copy handoff. Owner-held leases with worker ack/cancel channels, chunked streaming with worker affinity, atomic temp+rename, XXHash integrity. |
+
+Each Rust crate has a thin Python facade in [`python/`](python/) built
+with [PyO3](https://pyo3.rs) / [maturin](https://www.maturin.rs).
+
+## Design highlights
+
+- **BLAKE3-derived namespace handles.** Two peers with the same
+  human-readable description derive the same internal handle and attach
+  to the same SHM region — no manual coordination of magic strings.
+- **Owner-held leases.** Sink's lease-renewal model keeps lifecycle
+  state with the producer, so slow worker subprocesses can't be
+  reclaimed mid-read (avoids a classic SHM stale-handle race).
+- **Section-aware Ring API.** Writers and readers index into named
+  sections; the library never inspects payloads or runs a classifier
+  on the caller's behalf.
+- **Cross-container IPC as a first-class capability.** Pool's
+  single-owner-multi-attacher design works inside one container today
+  and across containers via shared `ipc:` namespaces. Lifecycle, lease
+  coordination, crash recovery, and security posture are all explicit
+  design dimensions, not bolted-on opaque modes.
+- **Forward-compatible API.** v0.1 surfaces are bytes-only with strict
+  explicit-release lifecycle, but the lease/descriptor shape leaves room
+  for typed slot views (Arrow / NumPy zero-copy) and eviction-aware
+  policies as additive capabilities.
+
+## Status
+
+**v0.0.1 — scaffold only.** The workspace builds (`cargo check
+--workspace` passes) but implementations are placeholder structs. The
+core implementations land per the staged plan:
+
+| Stage | What |
+|---|---|
+| 4a | Pool — Rust core + PyO3 facade |
+| 4b | Ring — Rust core + PyO3 facade |
+| 4c | Sink — Rust core + PyO3 facade (depends on Pool) |
+| 5 | Open-source posture pass (API isolation audit, README docs, examples) and v0.1.0 release to crates.io + PyPI |
+
+Track the plan in the upstream Certus repo:
+`claudedocs/plans/mp_tools_open_source_extraction_2026-05-23.md` in
+[Indubitable-Industries/Bayence-Certus](https://github.com/Indubitable-Industries/Bayence-Certus).
+
+## Quick start (future, v0.1.0+)
+
+```python
+from tessera_pool import Pool
+from tessera_ring import Ring
+from tessera_sink import Sink
+
+# Non-lossy SHM pool — transactional large payloads
+with Pool(slot_count=8, slot_size_bytes=64 * 1024 * 1024, description="my-app/batches") as pool:
+    lease = pool.acquire()
+    descriptor = pool.write(lease, payload_bytes)
+    # ... hand `descriptor` across IPC to a worker ...
+    pool.release(lease)
+
+# Lossy multi-reader ring — telemetry-shaped streams
+with Ring(sections={"logs": {"slot_count": 4096, "slot_size_bytes": 2048}},
+          description="my-app/telemetry") as ring:
+    ring.publish("logs", event_bytes)
+    for event in ring.reader("log-drainer", section="logs").poll():
+        ...
+
+# Atomic-write pool — chunked Pool-backed disk writes
+with Sink(worker_count=4, pool_description="my-app/artifacts") as sink:
+    sink.submit("/path/to/output.bin", payload_bytes, fsync=True)
+    sink.flush()
+```
+
+## Workspace layout
+
+```
+tessera/
+├── Cargo.toml                # workspace manifest
+├── README.md                 # this file
+├── LICENSE-MIT / LICENSE-APACHE
+├── crates/                   # pure Rust cores (usable from Rust without Python)
+│   ├── tessera-pool/
+│   ├── tessera-ring/
+│   └── tessera-sink/
+├── python/                   # PyO3 facades (one per Rust crate)
+│   ├── py-tessera-pool/
+│   ├── py-tessera-ring/
+│   └── py-tessera-sink/
+├── examples/                 # cross-component demos (populated in Stage 4+)
+└── .github/workflows/        # CI: cargo check / cargo test / maturin build
+```
+
+The PyPI distribution name is hyphenated (`tessera-pool`); the Python
+import module is underscored (`tessera_pool`):
+
+```python
+# pyproject.toml:
+tessera-pool = "^0.1.0"
+
+# in code:
+from tessera_pool import Pool
+```
+
+## Building locally
+
+Rust workspace (no Python toolchain required for core crates):
+
+```sh
+cargo check --workspace
+cargo test  --workspace
+```
+
+Python facades (requires Python ≥3.10 and [maturin](https://www.maturin.rs)):
+
+```sh
+pip install maturin
+cd python/py-tessera-pool   # or py-tessera-ring / py-tessera-sink
+maturin develop             # builds + installs into the active venv as editable
+```
+
+## Licensing
+
+Dual-licensed under [MIT](LICENSE-MIT) **OR** [Apache-2.0](LICENSE-APACHE),
+at your option. This matches the prevailing convention for open-source
+Rust crates and is friendly to use in proprietary, GPL, and permissively
+licensed downstream projects alike.
+
+## Acknowledgments
+
+Tessera was extracted from the [Certus](https://github.com/Indubitable-Industries/Bayence-Certus)
+project's `certus/mp/` and `certus/telemetry/` packages. The architectural
+decisions (single-owner lifecycle, single-writer-lease, owner-held lease
+renewal for Sink, caller-supplied Ring sections, etc.) and the
+verification framework all originated there.

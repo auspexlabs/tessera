@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tessera-pool",
+    "crates/tessera-ring",
+    "crates/tessera-sink",
+    "python/py-tessera-pool",
+    "python/py-tessera-ring",
+    "python/py-tessera-sink",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.0.1"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Indubitable-Industries/tessera"
+authors = ["Indubitable Industries"]
+rust-version = "1.74"
+
+[workspace.dependencies]
+# Core crates (path references — become registry references at publish time)
+tessera-pool = { path = "crates/tessera-pool", version = "0.0.1" }
+tessera-ring = { path = "crates/tessera-ring", version = "0.0.1" }
+tessera-sink = { path = "crates/tessera-sink", version = "0.0.1" }
+
+# Shared third-party
+blake3 = "1.5"
+pyo3 = { version = "0.22", features = ["extension-module"] }

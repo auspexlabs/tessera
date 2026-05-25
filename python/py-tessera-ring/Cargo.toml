@@ -1,0 +1,17 @@
+[package]
+name = "py-tessera-ring"
+description = "Python bindings for tessera-ring (Tessera Ring)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "tessera_ring"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { workspace = true }
+tessera-ring = { workspace = true }

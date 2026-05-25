@@ -1,0 +1,16 @@
+[package]
+name = "tessera-sink"
+description = "Atomic-write worker pool to disk, built on tessera-pool (Tessera Sink)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+
+[lib]
+name = "tessera_sink"
+
+[dependencies]
+tessera-pool = { workspace = true }

@@ -1,0 +1,18 @@
+[package]
+name = "py-tessera-sink"
+description = "Python bindings for tessera-sink (Tessera Sink)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "tessera_sink"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { workspace = true }
+tessera-sink = { workspace = true }
+tessera-pool = { workspace = true }

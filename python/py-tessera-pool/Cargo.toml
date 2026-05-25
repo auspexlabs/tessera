@@ -1,0 +1,17 @@
+[package]
+name = "py-tessera-pool"
+description = "Python bindings for tessera-pool (Tessera Pool)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "tessera_pool"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { workspace = true }
+tessera-pool = { workspace = true }
