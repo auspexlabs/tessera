@@ -13,5 +13,6 @@ name = "tessera_pool"
 crate-type = ["cdylib"]
 
 [dependencies]
+parking_lot = "0.12"
 pyo3 = { workspace = true }
 tessera-pool = { workspace = true }
