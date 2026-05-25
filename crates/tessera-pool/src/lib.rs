@@ -14,10 +14,12 @@
 pub mod error;
 pub mod header;
 pub mod namespace;
+pub mod pool;
 pub mod region;
 
 pub use error::{Result, TesseraPoolError};
 pub use namespace::NamespaceHandle;
+pub use pool::{Pool, PoolConfig};
 
 /// 128-bit lease identifier returned by `Pool::acquire`.
 ///
@@ -156,8 +158,3 @@ impl Descriptor {
     }
 }
 
-/// Placeholder Pool type — full state machine lands in subsequent
-/// Stage 4a commits.
-pub struct Pool {
-    _placeholder: (),
-}
