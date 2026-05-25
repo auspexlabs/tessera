@@ -37,6 +37,7 @@ pub struct PoolConfig {
 
 /// Internal owner-side bookkeeping. Lives in process memory; not
 /// shared across the SHM boundary.
+#[derive(Debug)]
 struct OwnerState {
     /// Lock-free queue of currently-free slot indices. Acquire pops;
     /// release / reclaim_stale push.
@@ -54,6 +55,7 @@ struct OwnerState {
 /// `is_owner: true`); zero or more attachers may construct with
 /// `is_owner: false` and consume payload bytes via descriptors handed
 /// across IPC.
+#[derive(Debug)]
 pub struct Pool {
     region: Region,
     owner_state: Option<OwnerState>,
@@ -228,12 +230,47 @@ impl Pool {
     /// match the slot's current metadata — catches the case where the
     /// owner reclaimed the slot before the descriptor holder finished
     /// consuming.
+    ///
+    /// Bound-checks `descriptor.size_bytes()` against the slot's
+    /// stored `payload_len` AND against the slot capacity. Descriptors
+    /// can be constructed by callers via `Descriptor::new` or
+    /// reconstructed from pickled bytes, so we cannot trust the
+    /// descriptor-claimed size in isolation — defense in depth against
+    /// over-read.
     pub fn read_payload(&self, descriptor: &Descriptor) -> Result<Vec<u8>> {
-        let meta = self.region.read_slot_meta(descriptor.slot_index());
+        // Slot-index bounds: region read_slot_meta debug_asserts; check here too.
+        let slot_index = descriptor.slot_index();
+        if slot_index >= self.region.slot_count() {
+            return Err(TesseraPoolError::Region(format!(
+                "descriptor slot_index {slot_index} out of range (slot_count={})",
+                self.region.slot_count()
+            )));
+        }
+        let meta = self.region.read_slot_meta(slot_index);
         validate_descriptor(descriptor, &meta)?;
-        Ok(self
-            .region
-            .read_slot_payload(descriptor.slot_index(), descriptor.size_bytes()))
+        // Descriptor size must match what was actually written. A
+        // larger value would read past the written payload (potentially
+        // uninitialized bytes); a smaller value silently truncates.
+        // Both indicate descriptor tampering / mismatch.
+        if descriptor.size_bytes() != meta.payload_len {
+            return Err(TesseraPoolError::Region(format!(
+                "descriptor size_bytes ({}) does not match slot's stored payload_len ({}); \
+                refusing to read",
+                descriptor.size_bytes(),
+                meta.payload_len
+            )));
+        }
+        // And capacity (redundant given the above + the write-time
+        // OversizedPayload check, but defense in depth in case the
+        // slot meta was somehow stamped past capacity).
+        if descriptor.size_bytes() > self.region.slot_size_bytes() {
+            return Err(TesseraPoolError::Region(format!(
+                "descriptor size_bytes ({}) exceeds slot capacity ({})",
+                descriptor.size_bytes(),
+                self.region.slot_size_bytes()
+            )));
+        }
+        self.region.read_slot_payload(slot_index, descriptor.size_bytes())
     }
 
     /// Release a leased slot (owner-only). The slot's metadata is
@@ -595,6 +632,77 @@ mod tests {
         ));
 
         owner.release(&lease).expect("owner release");
+    }
+
+    #[test]
+    fn concurrent_create_with_live_owner_refuses_to_clobber() {
+        // Codex P1-1 regression guard: if an owner is already alive for
+        // this region, a second `Pool::new(is_owner=true, ...)` must
+        // refuse rather than silently unlinking the live segment.
+        let config = owner_config("concurrent-create", 2, 256);
+        let _alive_owner = Pool::new(config.clone()).expect("first owner");
+        // Second attempt with the same description + geometry: should error.
+        let err = Pool::new(config.clone()).unwrap_err();
+        match err {
+            TesseraPoolError::Region(msg) => {
+                assert!(
+                    msg.contains("already exists") || msg.contains("Refusing to clobber"),
+                    "expected refuse-to-clobber error, got: {msg}"
+                );
+            }
+            other => panic!("expected Region error, got {other:?}"),
+        }
+        // The first owner is still alive and usable.
+        // (Drop happens when _alive_owner goes out of scope.)
+    }
+
+    #[test]
+    fn read_payload_rejects_descriptor_with_mismatched_size() {
+        // Codex P1-2 regression guard: a descriptor whose size_bytes
+        // doesn't match the slot's stored payload_len must be rejected
+        // BEFORE any payload bytes are copied. Otherwise a hand-crafted
+        // Descriptor::new could request an OOB read in release builds
+        // (debug_assert is stripped).
+        let mut pool = Pool::new(owner_config("size-mismatch", 1, 1024)).expect("new");
+        let lease = pool.acquire(Duration::from_secs(1)).expect("acquire");
+        let descriptor = pool.write(&lease, b"hello").expect("write");
+
+        // Lie about the size — claim 999 bytes when only 5 were written.
+        let oversized_descriptor =
+            Descriptor::new(descriptor.slot_index(), descriptor.lease_id(), descriptor.generation(), 999);
+        let err = pool.read_payload(&oversized_descriptor).unwrap_err();
+        match err {
+            TesseraPoolError::Region(msg) => {
+                assert!(
+                    msg.contains("does not match") || msg.contains("payload_len"),
+                    "expected size-mismatch error, got: {msg}"
+                );
+            }
+            other => panic!("expected Region error, got {other:?}"),
+        }
+
+        // Lying smaller (claim 2 bytes when 5 were written) also rejected —
+        // silent truncation is a tampering signal too.
+        let truncated_descriptor =
+            Descriptor::new(descriptor.slot_index(), descriptor.lease_id(), descriptor.generation(), 2);
+        let err = pool.read_payload(&truncated_descriptor).unwrap_err();
+        assert!(matches!(err, TesseraPoolError::Region(_)));
+
+        // The legitimate descriptor still works.
+        let bytes = pool.read_payload(&descriptor).expect("legit read");
+        assert_eq!(bytes.as_slice(), b"hello");
+
+        pool.release(&lease).expect("release");
+    }
+
+    #[test]
+    fn read_payload_rejects_out_of_range_slot_index() {
+        // Defense in depth: a hand-crafted descriptor with slot_index
+        // beyond slot_count must be rejected, not silently OOB-read.
+        let pool = Pool::new(owner_config("oob-slot", 2, 64)).expect("new");
+        let bogus = Descriptor::new(99, crate::LeaseId::from_bytes([0; 16]), 0, 1);
+        let err = pool.read_payload(&bogus).unwrap_err();
+        assert!(matches!(err, TesseraPoolError::Region(_)));
     }
 
     #[test]

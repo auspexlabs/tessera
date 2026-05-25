@@ -60,26 +60,45 @@ impl Region {
         let size = region_size_bytes(slot_count, slot_size_bytes);
         let name = handle.shm_name();
 
-        // Open exclusively; if the segment already exists (stale from a
-        // crashed prior owner), we cannot safely reuse it because we'd
-        // overwrite live data. Fall back to recreate per §3.5.b after
-        // unlinking the stale segment.
+        // Open exclusively. If the segment already exists, do NOT blindly
+        // unlink — that could detach another live owner's segment from
+        // its name and split participants across two regions. Instead:
+        // attach + validate the existing header. If it matches the
+        // caller's geometry + handle digest, refuse to clobber (another
+        // owner is presumably alive). If it fails validation (stale
+        // header from a crashed prior owner, different geometry,
+        // garbage bytes), unlink + recreate is safe.
         let shmem = match ShmemConf::new().size(size).os_id(&name).create() {
             Ok(shmem) => shmem,
             Err(ShmemError::LinkExists) | Err(ShmemError::MappingIdExists) => {
-                // Stale segment from a crashed prior owner — unlink and
-                // retry. We make one attempt; if that still fails the
-                // OS surface is reporting something we can't recover from.
-                let _ = unlink_named_region(&name);
-                ShmemConf::new()
-                    .size(size)
-                    .os_id(&name)
-                    .create()
-                    .map_err(|e| {
-                        TesseraPoolError::Region(format!(
-                            "create after unlink retry: {e}"
-                        ))
-                    })?
+                let probe_handle = handle.clone();
+                match Region::attach(&probe_handle, slot_count, slot_size_bytes) {
+                    Ok(_existing_valid) => {
+                        // Existing segment is structurally valid for our
+                        // geometry + handle. Refuse to clobber.
+                        return Err(TesseraPoolError::Region(format!(
+                            "Pool region '{name}' already exists with matching geometry; \
+                            another owner may be alive. Refusing to clobber. If this is \
+                            recovery from a crashed prior owner, manually shm_unlink the \
+                            segment first (e.g. `rm /dev/shm{name}`)."
+                        )));
+                    }
+                    Err(_validation_failed) => {
+                        // Existing segment doesn't match — stale, garbage, or
+                        // different geometry. Safe to unlink + recreate.
+                        let _ = unlink_named_region(&name);
+                        ShmemConf::new()
+                            .size(size)
+                            .os_id(&name)
+                            .create()
+                            .map_err(|e| {
+                                TesseraPoolError::Region(format!(
+                                    "create after unlink (existing segment failed \
+                                    validation): {e}"
+                                ))
+                            })?
+                    }
+                }
             }
             Err(e) => return Err(TesseraPoolError::Region(format!("create: {e}"))),
         };
@@ -286,17 +305,34 @@ impl Region {
     /// Read a copy of slot `slot_index`'s payload bytes (first
     /// `payload_len` bytes). Used by attached readers consuming a
     /// descriptor.
-    pub fn read_slot_payload(&self, slot_index: u32, payload_len: u32) -> Vec<u8> {
-        debug_assert!(slot_index < self.slot_count);
-        debug_assert!(payload_len <= self.slot_size_bytes);
+    ///
+    /// Returns an error if `slot_index` is out of range or
+    /// `payload_len` exceeds the slot capacity. Callers in this crate
+    /// should also clamp `payload_len` against the slot's current
+    /// `payload_len` metadata before calling (see `Pool::read_payload`).
+    pub fn read_slot_payload(&self, slot_index: u32, payload_len: u32) -> Result<Vec<u8>> {
+        if slot_index >= self.slot_count {
+            return Err(TesseraPoolError::Region(format!(
+                "slot_index {slot_index} out of range (slot_count={})",
+                self.slot_count
+            )));
+        }
+        if payload_len > self.slot_size_bytes {
+            return Err(TesseraPoolError::Region(format!(
+                "payload_len {payload_len} exceeds slot capacity {}",
+                self.slot_size_bytes
+            )));
+        }
         let offset = slot_payload_offset(slot_index, self.slot_count, self.slot_size_bytes);
         let mut out = vec![0u8; payload_len as usize];
-        // SAFETY: as above.
+        // SAFETY: bounds verified above; we hold &self so no in-process
+        // writer is racing this region (owner-side writes go through
+        // &mut self elsewhere).
         unsafe {
             let src = self.shmem.as_ptr().add(offset);
             core::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), payload_len as usize);
         }
-        out
+        Ok(out)
     }
 
     // --- Cleanup ---------------------------------------------------
@@ -473,10 +509,10 @@ mod tests {
         let mut region = Region::create(&handle, 2, 64, 30_000_000).expect("create");
         let payload: Vec<u8> = (0..32).collect();
         region.write_slot_payload(0, &payload);
-        let read = region.read_slot_payload(0, 32);
+        let read = region.read_slot_payload(0, 32).expect("read");
         assert_eq!(read, payload);
         // Slot 1 was untouched.
-        let other = region.read_slot_payload(1, 32);
+        let other = region.read_slot_payload(1, 32).expect("read other");
         assert_eq!(other, vec![0u8; 32]);
     }
 
@@ -491,7 +527,9 @@ mod tests {
         creator.write_slot_payload(2, b"hello attacher");
 
         let attacher = Region::attach(&handle, 4, 128).expect("attach");
-        let read = attacher.read_slot_payload(2, b"hello attacher".len() as u32);
+        let read = attacher
+            .read_slot_payload(2, b"hello attacher".len() as u32)
+            .expect("read");
         assert_eq!(read.as_slice(), b"hello attacher");
     }
 }

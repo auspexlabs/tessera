@@ -275,16 +275,73 @@ def test_attacher_cannot_mutate():
 
 
 def test_context_manager_releases_on_exit():
-    """Pool's Drop fires when the Python object is garbage-collected.
-    Verify that after the context manager exits, a fresh Pool with
-    the same description can be created (i.e., the previous segment
-    was unlinked or doesn't block re-creation)."""
+    """Pool's Drop fires when the Python object is garbage-collected,
+    which unlinks the SHM segment. After the first Pool is fully
+    reclaimed (force GC so timing is deterministic), a fresh Pool with
+    the same description can be created.
+
+    Note: as of the Codex P1 fix, `Pool::new` no longer blindly
+    unlinks an existing same-name segment — it refuses to clobber. So
+    this test depends on the first Pool's Drop actually firing
+    BEFORE the second `Pool(...)` call. We force the GC explicitly.
+    """
+    import gc
+
     desc = _unique_description("ctxmgr-recycle")
     with Pool(description=desc, slot_count=1, slot_size_bytes=64, ttl_seconds=10.0) as p1:
         lease = p1.acquire(timeout_seconds=1.0)
         p1.release(lease)
-    # If the SHM segment was leaked, the second `Pool(...)` would
-    # either fail to create (segment exists) or fail-and-recreate
-    # via the stale-unlink fallback. Either way, no exception leaks:
+    # Force the first Pool to be reclaimed — Drop unlinks the SHM segment.
+    del p1
+    gc.collect()
+    # Now a fresh Pool with the same description can claim the name.
     with Pool(description=desc, slot_count=1, slot_size_bytes=64, ttl_seconds=10.0) as p2:
         assert p2.is_owner is True
+
+
+def test_concurrent_create_with_live_owner_refuses_to_clobber():
+    """Codex P1-1 regression: a second `Pool(is_owner=True)` against
+    the same description as a live first owner must error rather than
+    silently unlinking the live segment."""
+    desc = _unique_description("concurrent-create")
+    p1 = Pool(description=desc, slot_count=2, slot_size_bytes=64, ttl_seconds=10.0)
+    try:
+        with pytest.raises(TesseraPoolError, match="already exists|Refusing to clobber"):
+            Pool(description=desc, slot_count=2, slot_size_bytes=64, ttl_seconds=10.0)
+        # The first owner is still alive and usable.
+        lease = p1.acquire(timeout_seconds=1.0)
+        p1.release(lease)
+    finally:
+        del p1
+
+
+def test_read_payload_rejects_tampered_descriptor_size():
+    """Codex P1-2 regression: read_payload must validate
+    descriptor.size_bytes against the slot's stored payload_len
+    (and capacity) before copying."""
+    from tessera_pool import _descriptor_from_bytes
+
+    desc = _unique_description("size-mismatch")
+    with Pool(description=desc, slot_count=1, slot_size_bytes=1024, ttl_seconds=10.0) as pool:
+        lease = pool.acquire(timeout_seconds=1.0)
+        descriptor = pool.write(lease, b"hello")
+
+        # Tamper: reconstruct a Descriptor with the same identity but
+        # an inflated size_bytes (claim 999 bytes when only 5 were written).
+        # Uses the same pickle factory the binding exposes.
+        # First, get the lease_id bytes back from the descriptor.
+        lease_id_bytes = bytes.fromhex(descriptor.lease_id_hex)
+        tampered = _descriptor_from_bytes(
+            descriptor.slot_index,
+            descriptor.generation,
+            lease_id_bytes,
+            999,  # over-stated size
+        )
+        with pytest.raises(TesseraPoolError, match="does not match|payload_len|exceeds"):
+            pool.read_payload(tampered)
+
+        # The legitimate descriptor still works.
+        bytes_back = pool.read_payload(descriptor)
+        assert bytes_back == b"hello"
+
+        pool.release(lease)
