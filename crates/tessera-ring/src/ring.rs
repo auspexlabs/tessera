@@ -52,21 +52,27 @@ use crate::SectionConfig;
 const ODD_SEQUENCE_SPIN_BUDGET: u32 = 128;
 
 /// Maximum spin iterations a Writer will wait while observing the
-/// SAME odd sequence value on a slot before attempting recovery.
+/// SAME odd sequence value on a slot before declaring it stuck and
+/// returning `TesseraRingError::SlotStuck`.
 ///
 /// Set ~1M (≈1-10 ms on modern CPUs with `spin_loop` hints). This
 /// gives a live-but-stalled writer ample wall time to finish — even
 /// through a page fault or scheduler hiccup — but caps the wait so a
-/// dead writer (panicked, killed, or wedged) cannot poison the slot
-/// indefinitely and stall production traffic when `writer_position`
-/// wraps back to it.
+/// dead writer (panicked, killed, or wedged) cannot stall the publish
+/// indefinitely.
 ///
 /// Counter resets every time the observed sequence value changes,
 /// because *progress* in the sequence means a real writer is making
 /// forward progress; we only suspect death when the value sits still.
 ///
-/// Codex P1 fix on PR #2 / commit 0e39176.
-const WRITER_ODD_SEQ_RECOVERY_BUDGET: u32 = 1_000_000;
+/// Codex iter-3 P1 (commit 0e39176) introduced the bounded spin;
+/// iter-4 P1 (commit a559f2d) initially attempted slot-recovery via
+/// CAS but that risked corrupting the slot when the original writer
+/// was alive-but-paged-out (Codex iter-5 P1). The current design
+/// returns `SlotStuck` instead — strictly safer; callers handle the
+/// failure mode (typically: log + monitor for sustained stuck slots,
+/// rebuild the Ring if necessary).
+const WRITER_ODD_SEQ_TIMEOUT_BUDGET: u32 = 1_000_000;
 
 /// Configuration for opening a Ring region. Mirrors `tessera_pool::PoolConfig`'s
 /// shape: a description string for namespace derivation, the section
@@ -215,41 +221,34 @@ impl Writer {
         //    This serializes writers per-slot but does NOT block writers
         //    targeting different slots — concurrency stays high as long
         //    as the writer load is spread across many slots.
-        // CAS-acquire with bounded-spin recovery. Two findings shape
+        // CAS-acquire with bounded-spin-then-fail. Three findings shape
         // this loop:
         //
         // - Codex iter-1 P1 (commit d467b14): unconditional load+store
         //   to set odd let two concurrent writers wrap to the same
         //   slot enter the odd state simultaneously. Replaced with
-        //   compare_exchange to ensure only one writer holds odd at
-        //   a time.
+        //   compare_exchange so only one writer can hold odd at a time.
         //
         // - Codex iter-3 P1 (commit 0e39176): the CAS loop was
         //   *unbounded* on observed-odd. A writer killed/panicked
-        //   mid-write left the slot's sequence stuck odd. When
-        //   writer_position wrapped back, the next writer spun
-        //   forever — breaking the lossy/non-blocking contract.
+        //   mid-write left the slot's sequence stuck odd; the next
+        //   writer to wrap to that slot spun forever — breaking the
+        //   lossy/non-blocking contract.
         //
-        // Recovery protocol:
-        //   * Track the LAST observed odd value + a stuck-count.
-        //   * If the value changes while we're spinning, the holder
-        //     is making forward progress → reset the counter.
-        //   * If the value stays the same for WRITER_ODD_SEQ_RECOVERY_BUDGET
-        //     iterations, the holder is almost certainly dead. CAS
-        //     from observed_odd → observed_odd+2 (still odd, but now
-        //     WE own the odd state).
-        //   * If the recovery CAS *fails*, something is happening
-        //     concurrently after all — reset counter, resume normal
-        //     spin loop. This avoids racing a slow-but-live writer
-        //     when we misjudged death.
+        // - Codex iter-5 P1 (commit a559f2d): the initial recovery
+        //   design (CAS odd → odd+2 to "take over" a stuck slot)
+        //   risked corrupting the slot if the original writer was
+        //   alive-but-paged-out rather than dead — its delayed
+        //   payload/header writes would interleave with the new
+        //   writer's, and the reader's seqlock+position check could
+        //   either deliver torn data or drop the recovered event
+        //   silently. The seqlock-on-shared-slot model can't safely
+        //   steal a slot from a possibly-live writer.
         //
-        // Residual risk: a writer that wakes up after our recovery
-        // CAS will store its delayed even-value over our in-progress
-        // write, potentially corrupting the slot. The reader-side
-        // `slot.position == cursor` cross-check catches the common
-        // case (stale position != current cursor). The remaining
-        // window is "live writer paged out for >1ms" which is rare on
-        // a modern OS; the lossy contract accepts this trade-off.
+        // Current protocol: bounded spin + return SlotStuck on
+        // exhaustion. The slot stays poisoned; callers must rebuild
+        // the Ring (force_recreate=true) to clear it. Other slots in
+        // the section are unaffected.
         let seq_atomic = self.region.slot_sequence_atomic(ordinal, slot_index)?;
         let seq_writing = loop {
             let seq_before = seq_atomic.load(Ordering::Acquire);
@@ -268,39 +267,17 @@ impl Writer {
                         break;
                     }
                     stuck_count += 1;
-                    if stuck_count > WRITER_ODD_SEQ_RECOVERY_BUDGET {
-                        // Holder appears dead. Attempt recovery via
-                        // CAS: transition stuck_seq → stuck_seq + 2
-                        // (still odd, but ownership transfers to us).
-                        let candidate = stuck_seq.wrapping_add(2);
-                        match seq_atomic.compare_exchange(
-                            stuck_seq,
-                            candidate,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        ) {
-                            Ok(_) => {
-                                // Recovery succeeded — slot is ours.
-                                return self.finalize_publish(
-                                    ordinal,
-                                    slot_index,
-                                    position,
-                                    bytes,
-                                    seq_atomic,
-                                    candidate,
-                                );
-                            }
-                            Err(_) => {
-                                // Sequence changed concurrently —
-                                // restart the outer loop with fresh
-                                // observation. This catches the case
-                                // where the writer wasn't actually
-                                // dead, just very slow, and made
-                                // progress right as we attempted
-                                // recovery.
-                                break;
-                            }
-                        }
+                    if stuck_count > WRITER_ODD_SEQ_TIMEOUT_BUDGET {
+                        // Holder appears dead — but we cannot safely
+                        // steal the slot because a delayed wakeup
+                        // would interleave its writes with ours.
+                        // Return SlotStuck and let the caller handle.
+                        return Err(TesseraRingError::SlotStuck {
+                            section_id,
+                            slot_index,
+                            position,
+                            stuck_sequence: stuck_seq,
+                        });
                     }
                 }
                 continue;
@@ -321,28 +298,6 @@ impl Writer {
             }
         };
 
-        self.finalize_publish(ordinal, slot_index, position, bytes, seq_atomic, seq_writing)
-    }
-
-    /// Common tail of `publish` once the seqlock-odd state has been
-    /// acquired (either via the normal CAS path or via the stuck-slot
-    /// recovery CAS). Writes header fields + payload inside the odd
-    /// window, then stores the seqlock-even state.
-    ///
-    /// # Safety
-    ///
-    /// Caller must hold the seqlock-odd state on `slot_sequence_atomic`
-    /// via `seq_writing` being the most-recent odd value stored by
-    /// this thread.
-    fn finalize_publish(
-        &self,
-        ordinal: u32,
-        slot_index: u32,
-        position: u64,
-        bytes: &[u8],
-        seq_atomic: &std::sync::atomic::AtomicU64,
-        seq_writing: u64,
-    ) -> Result<()> {
         // Write the slot header fields + payload inside the odd
         // window. SAFETY: we hold the seqlock-odd state on this
         // slot's sequence counter; any concurrent reader sees odd
@@ -363,13 +318,7 @@ impl Writer {
         }
 
         // Bump slot.sequence to even (stable). Release so readers'
-        // subsequent Acquire-load observes the prior writes. We add 1
-        // to seq_writing rather than computing seq_before+2: in the
-        // normal path this equals seq_before+2 (consistent with the
-        // seqlock protocol); in the recovery path seq_writing is the
-        // value we CAS'd in (e.g. stuck_seq+2), and adding 1 produces
-        // a fresh stable value strictly greater than any value the
-        // dead writer was about to produce.
+        // subsequent Acquire-load observes the prior writes.
         let seq_done = seq_writing.wrapping_add(1);
         seq_atomic.store(seq_done, Ordering::Release);
 
@@ -867,12 +816,20 @@ mod tests {
     }
 
     #[test]
-    fn publish_recovers_from_externally_poisoned_sequence() {
-        // Direct simulation of a dead writer: open the Ring as owner,
-        // then via a peer attacher poke the slot's sequence to an
-        // odd value (simulating the dead writer left the seqlock in
-        // odd state). The owner's next publish must recover by CAS
-        // and complete within the spin budget.
+    fn publish_returns_slot_stuck_on_externally_poisoned_sequence() {
+        // Codex iter-5 P1 fix on PR #2 / commit a559f2d:
+        // Writer::publish does NOT try to steal a stuck slot from a
+        // possibly-live writer (the prior iter-4 design did, and was
+        // flagged by Codex as unsafe — a delayed wakeup would
+        // interleave writes and corrupt the slot or silently drop
+        // the recovered publish). Instead, the publish returns
+        // `Err(SlotStuck)` after the bounded budget; the slot stays
+        // poisoned until the Ring is rebuilt.
+        //
+        // Direct simulation: open the Ring as owner, use a peer
+        // attacher Region to poke slot 0's sequence to odd (no
+        // intention of ever flipping it back), then call publish.
+        // Must return Err(SlotStuck) within wall-clock seconds.
         use std::sync::atomic::Ordering;
 
         let desc = unique_description("externally-poisoned");
@@ -886,8 +843,7 @@ mod tests {
         };
         let owner_ring = Ring::open(owner_cfg).expect("owner open");
 
-        // Open an attacher Region directly to access slot_sequence_atomic
-        // (Ring doesn't expose it on its public API; that's deliberate).
+        // Open an attacher Region directly to access slot_sequence_atomic.
         let attacher_region = crate::region::Region::attach(
             &crate::namespace::NamespaceHandle::derive(&desc),
             &sections,
@@ -900,27 +856,89 @@ mod tests {
         // Poison the slot — store odd.
         seq.store(1, Ordering::Release);
 
-        // Now publish from the owner. With unbounded spin, this would
-        // hang forever; with bounded recovery, it returns after the
-        // budget is exhausted (1M iterations, ≈ms).
+        // Publish must return SlotStuck within the bounded budget.
         let start = std::time::Instant::now();
         let writer = owner_ring.writer();
-        writer
-            .publish(0, b"after recovery")
-            .expect("publish should recover from poisoned slot");
+        let err = writer
+            .publish(0, b"stuck-test")  // 10 bytes ≤ 16 slot_size
+            .expect_err("publish must fail on poisoned slot, not hang or recover");
         let elapsed = start.elapsed();
         assert!(
             elapsed.as_secs() < 5,
-            "publish hung after poisoned-slot recovery (elapsed: {elapsed:?})"
+            "publish hung past the budget (elapsed: {elapsed:?})"
         );
+        match err {
+            TesseraRingError::SlotStuck {
+                section_id,
+                slot_index,
+                stuck_sequence,
+                ..
+            } => {
+                assert_eq!(section_id, 0);
+                assert_eq!(slot_index, 0);
+                assert_eq!(stuck_sequence, 1);
+            }
+            other => panic!("expected SlotStuck, got {other:?}"),
+        }
 
-        // After recovery + publish, sequence should be even and
-        // strictly greater than 1.
-        let after = seq.load(Ordering::Acquire);
-        assert_eq!(after & 1, 0, "sequence should be even after publish");
-        assert!(after > 1, "sequence should advance past the poisoned value");
+        // Sequence is still 1 — we didn't try to steal the slot.
+        assert_eq!(seq.load(Ordering::Acquire), 1);
 
         drop(attacher_region);
+    }
+
+    #[test]
+    fn other_slots_remain_usable_when_one_is_stuck() {
+        // Codex iter-5 P1 follow-up: when SlotStuck fires on one slot,
+        // other slots in the same section MUST remain fully usable.
+        // The Ring is "lossy on the stuck slot only" — not "broken
+        // globally". Verify by poisoning slot 0 of a multi-slot
+        // section; publishes that land on slots 1..N succeed.
+        use std::sync::atomic::Ordering;
+
+        let desc = unique_description("partial-poison");
+        // 8 slots; the only one we poison is slot 0. Other 7 are healthy.
+        let sections = vec![SectionConfig::new(0, 8, 16)];
+
+        let owner_ring = Ring::open(RingConfig {
+            description: desc.clone(),
+            sections: sections.clone(),
+            is_owner: true,
+            force_recreate: false,
+        })
+        .expect("owner open");
+
+        let attacher = crate::region::Region::attach(
+            &crate::namespace::NamespaceHandle::derive(&desc),
+            &sections,
+        )
+        .expect("attacher");
+        attacher
+            .slot_sequence_atomic(0, 0)
+            .unwrap()
+            .store(1, Ordering::Release);
+
+        let writer = owner_ring.writer();
+        let mut stuck_count = 0;
+        let mut success_count = 0;
+
+        // Publish 8 events. With slot_count=8 and a fresh writer_position=0,
+        // positions 0..8 map to slot_index 0..7 one-to-one. Position 0
+        // hits the poisoned slot; positions 1..7 hit healthy slots.
+        for i in 0..8u32 {
+            match writer.publish(0, &i.to_le_bytes()) {
+                Ok(_) => success_count += 1,
+                Err(TesseraRingError::SlotStuck { slot_index, .. }) => {
+                    stuck_count += 1;
+                    assert_eq!(slot_index, 0, "only slot 0 should be poisoned");
+                }
+                Err(other) => panic!("unexpected error: {other:?}"),
+            }
+        }
+        assert_eq!(stuck_count, 1, "exactly one publish should hit the stuck slot");
+        assert_eq!(success_count, 7, "all healthy slots should publish successfully");
+
+        drop(attacher);
     }
 
     #[test]

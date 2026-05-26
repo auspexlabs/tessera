@@ -79,6 +79,46 @@ pub enum TesseraRingError {
         /// Section-configured slot capacity.
         slot_size: usize,
     },
+
+    /// `Writer::publish` observed a slot whose seqlock stayed stuck at
+    /// the same odd value for the bounded recovery budget. The previous
+    /// writer is either dead (crashed / killed mid-publish) or
+    /// arbitrarily delayed.
+    ///
+    /// `Writer::publish` deliberately does NOT steal the slot from the
+    /// stale writer: the seqlock-on-shared-slot model can't safely
+    /// hand off when the original writer might still be alive, because
+    /// a delayed wakeup would interleave writes and corrupt the slot
+    /// (Codex iter-5 P1 on PR #2 / commit a559f2d).
+    ///
+    /// Caller behavior on `SlotStuck`:
+    /// - The lost write's slot stays poisoned. Subsequent publishes
+    ///   that wrap to the same slot will also fail.
+    /// - Other slots in the section remain fully usable; calling
+    ///   `publish` again will claim a *different* position (via the
+    ///   atomic counter) and likely land on a different slot.
+    /// - Persistent stuck slots indicate a Ring whose state is no
+    ///   longer trustworthy. Owners should monitor for sustained
+    ///   `SlotStuck` errors and rebuild the Ring (drop + recreate with
+    ///   `force_recreate=true`) to clear poisoned slots.
+    #[error(
+        "slot stuck on section {section_id} slot_index {slot_index}: \
+        sequence held at odd value {stuck_sequence} through the recovery \
+        budget. Previous writer (position ≤ {position}) appears dead or \
+        arbitrarily delayed; not safe to take over the slot. Subsequent \
+        publishes wrapping to this slot will also fail. Recover by \
+        rebuilding the Ring with force_recreate=true."
+    )]
+    SlotStuck {
+        /// Section id where the stuck slot lives.
+        section_id: u32,
+        /// Slot index within the section (= position % slot_count).
+        slot_index: u32,
+        /// Position the failing writer was attempting to publish at.
+        position: u64,
+        /// The odd sequence value observed throughout the spin budget.
+        stuck_sequence: u64,
+    },
 }
 
 /// Result alias for `tessera-ring` operations.
