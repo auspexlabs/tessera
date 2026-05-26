@@ -59,6 +59,15 @@ pub struct Region {
     /// the namespace handle. Codex P2 fix on PR #2 commit 9d7817b.
     shm_name: String,
     is_owner: bool,
+    /// True once `Region::unlink()` has been called successfully.
+    /// Used to short-circuit subsequent `unlink()` calls so a stale
+    /// owner can't race a successor's freshly-created region with the
+    /// same name. Mirrors the three-part Pool fix from PR #4 (iter-1
+    /// commit b18b95a, iter-3 commit 3987833, iter-4 commit 3baf46d).
+    /// Without this flag — and the matching `Shmem::set_owner(false)`
+    /// + return-code-gated state mutation — A's second unlink or
+    /// drop-time unlink would clobber B's name after a handoff.
+    manually_unlinked: bool,
 }
 
 impl core::fmt::Debug for Region {
@@ -160,6 +169,7 @@ impl Region {
             section_data_offsets,
             shm_name: name,
             is_owner: true,
+            manually_unlinked: false,
         };
         region.write_global_header(handle, epoch_micros);
         for (ordinal, cfg) in canonical.iter().enumerate() {
@@ -249,6 +259,7 @@ impl Region {
             section_data_offsets,
             shm_name: name,
             is_owner: false,
+            manually_unlinked: false,
         };
         region.validate_attached_global_header(handle)?;
         region.validate_attached_section_headers()?;
@@ -795,6 +806,15 @@ impl Region {
     /// reject attacher-side calls here as a Region error to enforce the
     /// lifecycle contract.
     pub fn unlink(&mut self) -> Result<()> {
+        // Idempotent short-circuit: once we've already unlinked, do
+        // nothing further. Mirrors Pool PR #4 iter-3 (commit 3987833,
+        // Codex comment 3304957184) — without this short-circuit, a
+        // stale owner A who calls unlink() a SECOND time after a
+        // successor B has recreated the same name would call
+        // libc::shm_unlink again and remove B's freshly-created name.
+        if self.manually_unlinked {
+            return Ok(());
+        }
         if !self.is_owner {
             return Err(TesseraRingError::Region(
                 "Region::unlink called by an attacher (is_owner=false). Only the \
@@ -803,10 +823,6 @@ impl Region {
                     .into(),
             ));
         }
-        // Direct call to libc::shm_unlink with the stored name. The
-        // `unlink_named_region` helper does the same thing but also
-        // tries to open+drop first; that's unnecessary here since the
-        // owner already has the mapping live.
         #[cfg(unix)]
         {
             let cname = std::ffi::CString::new(self.shm_name.as_str()).map_err(|_| {
@@ -817,12 +833,67 @@ impl Region {
                 )
             })?;
             // SAFETY: cname is a valid NUL-terminated C string;
-            // shm_unlink is thread-safe POSIX. Return value is
-            // ignored because this is best-effort idempotent cleanup
-            // (ENOENT is normal on the second call).
-            unsafe {
-                libc::shm_unlink(cname.as_ptr());
+            // shm_unlink is thread-safe POSIX.
+            //
+            // Mirrors Pool PR #4 iter-4 (commit 3baf46d, Codex
+            // comment 3305006943): check the return value and only
+            // flip state on success (rc == 0 or errno == ENOENT).
+            // On real failure (e.g. EACCES from a uid change
+            // mid-operation), return TesseraRingError::Region without
+            // flipping state — caller can retry, and Drop-time
+            // unlink remains active as a fallback.
+            let rc = unsafe { libc::shm_unlink(cname.as_ptr()) };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::ENOENT) {
+                    return Err(TesseraRingError::Region(format!(
+                        "shm_unlink('{}') failed: {} (errno={:?}). Region state \
+                        flags NOT updated; caller may retry unlink(), or drop \
+                        the Region to let Shmem's drop-time unlink attempt \
+                        cleanup.",
+                        self.shm_name,
+                        err,
+                        err.raw_os_error(),
+                    )));
+                }
+                // ENOENT: name was already gone. Falls through to
+                // the state-flip below as a successful unlink.
             }
+        }
+        // Codex P2 on PR #5 (comment 3305574604): on non-Unix
+        // platforms, POSIX shm_unlink is unavailable. Without an
+        // early return here, the state flip below would run
+        // unconditionally — unlink() would claim success without
+        // removing the OS name AND disable drop-time cleanup AND
+        // block future retries, leaking the name forever. Bail out
+        // explicitly so the caller knows unlink isn't supported on
+        // this platform and the Region remains in a recoverable
+        // state (Shmem's drop-time cleanup still active).
+        #[cfg(not(unix))]
+        {
+            return Err(TesseraRingError::Region(
+                "Region::unlink is not supported on non-Unix platforms (POSIX \
+                shm_unlink unavailable). Drop the Region to let the underlying \
+                shared_memory crate's drop-time cleanup attempt removal."
+                    .into(),
+            ));
+        }
+        // Below this point we're guaranteed to be on Unix AND the
+        // shm_unlink call succeeded (or returned ENOENT). State flip
+        // only happens once both gates are clear.
+        //
+        // Mirrors Pool PR #4 iter-1 (commit b18b95a, Codex comment
+        // 3304769711): suppress the Shmem's drop-time unlink so a
+        // handoff/restart sequence (owner A unlinks, owner B creates
+        // fresh region with same name, then A finally drops) does
+        // NOT have A's drop call shm_unlink AGAIN and remove B's
+        // freshly-created name.
+        #[cfg(unix)]
+        {
+            self.shmem.set_owner(false);
+            // Block any future unlink() call from this Region (iter-3
+            // pattern). Subsequent calls hit the early-return above.
+            self.manually_unlinked = true;
         }
         Ok(())
     }
@@ -1417,6 +1488,80 @@ mod tests {
         );
         // Idempotent: second unlink is safe.
         owner.unlink().expect("second unlink");
+    }
+
+    #[test]
+    fn unlink_disables_drop_time_unlink_for_handoff_safety() {
+        // Mirrors Pool PR #4 iter-1 fix (commit b18b95a, Codex
+        // comment 3304769711) applied here to Ring.
+        //
+        // Sequence under test:
+        //   1. A creates region X (name N).
+        //   2. A unlinks N (name removed; A's drop suppressed via set_owner(false)).
+        //   3. B creates a fresh region with name N (succeeds — A's
+        //      unlink cleared the name in step 2).
+        //   4. Drop A. With the fix, A's drop does NOT shm_unlink, so
+        //      B's name survives.
+        //   5. Attach to B by name — must succeed.
+        let handle = unique_handle("handoff-no-clobber");
+        let sections_a = vec![SectionConfig::new(0, 2, 64)];
+        let sections_b = vec![SectionConfig::new(0, 4, 128)];
+        let mut owner_a = Region::create(&handle, &sections_a, false).expect("A create");
+        owner_a.unlink().expect("A unlink");
+
+        let owner_b =
+            Region::create(&handle, &sections_b, false).expect("B create after A unlink");
+
+        drop(owner_a);
+
+        let attacher = Region::attach(&handle, &sections_b).expect("attach to B after A's drop");
+        assert_eq!(attacher.section_count(), 1);
+        assert_eq!(attacher.section_config(0).unwrap().slot_count(), 4);
+        drop(attacher);
+        drop(owner_b);
+    }
+
+    #[test]
+    fn stale_owners_second_unlink_does_not_clobber_successor() {
+        // Mirrors Pool PR #4 iter-3 fix (commit 3987833, Codex
+        // comment 3304957184) applied here to Ring.
+        //
+        // The set_owner(false) fix protects against A's *drop*
+        // clobbering B's name. This test verifies the complementary
+        // `manually_unlinked` short-circuit: A's *explicit second
+        // unlink()* must also be a no-op so it can't race a
+        // successor's freshly-created region.
+        //
+        // Sequence:
+        //   1. A creates region (name N).
+        //   2. A.unlink() — name N removed; flag set.
+        //   3. B creates fresh region with name N.
+        //   4. A.unlink() AGAIN — must be a true no-op (no
+        //      libc::shm_unlink, no Shmem mutation).
+        //   5. Attach to B — must succeed.
+        let handle = unique_handle("stale-double-unlink");
+        let sections_a = vec![SectionConfig::new(0, 2, 64)];
+        let sections_b = vec![SectionConfig::new(0, 4, 128)];
+        let mut owner_a = Region::create(&handle, &sections_a, false).expect("A create");
+        owner_a.unlink().expect("A first unlink");
+
+        let owner_b =
+            Region::create(&handle, &sections_b, false).expect("B create after A unlink");
+
+        owner_a
+            .unlink()
+            .expect("A second unlink should be a no-op");
+
+        let attacher =
+            Region::attach(&handle, &sections_b).expect("attach B after A's stale 2nd unlink");
+        assert_eq!(attacher.section_config(0).unwrap().slot_count(), 4);
+        drop(attacher);
+
+        drop(owner_a);
+        let attacher2 =
+            Region::attach(&handle, &sections_b).expect("attach B after A's drop");
+        drop(attacher2);
+        drop(owner_b);
     }
 
     #[test]
