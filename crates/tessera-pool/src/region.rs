@@ -436,6 +436,16 @@ impl Region {
                 libc::shm_unlink(cname.as_ptr());
             }
         }
+        // Codex P1 on PR #4 (comment 3304769711): suppress the
+        // Shmem's drop-time unlink. Without this, a handoff/restart
+        // sequence (owner A unlinks, owner B creates a fresh region
+        // with the same name, then A finally drops) would have A's
+        // drop call shm_unlink AGAIN, racily removing B's freshly
+        // created name and causing B's attachers/peers to fail.
+        // After explicit unlink we've already released name-ownership;
+        // the Shmem's mapping remains valid for this Region's lifetime
+        // but its drop must not re-touch the OS name.
+        self.shmem.set_owner(false);
         Ok(())
     }
 }
@@ -642,6 +652,46 @@ mod tests {
         );
         // Idempotent: second unlink is safe.
         owner.unlink().expect("second unlink");
+    }
+
+    #[test]
+    fn unlink_disables_drop_time_unlink_for_handoff_safety() {
+        // Codex P1 on PR #4 (comment 3304769711): after explicit
+        // unlink(), the Region must NOT re-unlink the name when it
+        // eventually drops. Otherwise a handoff/restart sequence
+        // (owner A unlinks, owner B creates a fresh region with the
+        // same name, then A drops) would have A's drop-time unlink
+        // clobber B's freshly-created name.
+        //
+        // Direct test:
+        //   1. A creates region X.
+        //   2. A unlinks the name.
+        //   3. B creates a fresh region with the same name (succeeds
+        //      because A's unlink removed the OS name).
+        //   4. Drop A. With the fix, A's drop does NOT call
+        //      shm_unlink, so B's name survives.
+        //   5. Attach to B by name — must succeed.
+        let handle = unique_handle("handoff-no-clobber");
+        let mut owner_a = Region::create(&handle, 2, 64, 60_000_000, false).expect("A create");
+        owner_a.unlink().expect("A unlink");
+
+        // B creates with the same handle. Without force_recreate this
+        // would normally fail "already exists", but A's unlink cleared
+        // the OS name so the create succeeds clean.
+        let owner_b =
+            Region::create(&handle, 4, 128, 60_000_000, false).expect("B create after A unlink");
+
+        // Drop A. The fix (set_owner(false) inside unlink) ensures A's
+        // drop does NOT call shm_unlink on the now-B-owned name.
+        drop(owner_a);
+
+        // B's name must still resolve.
+        let attacher = Region::attach(&handle, 4, 128).expect("attach to B after A's drop");
+        // Sanity: B's geometry, not A's.
+        assert_eq!(attacher.slot_count(), 4);
+        assert_eq!(attacher.slot_size_bytes(), 128);
+        drop(attacher);
+        drop(owner_b);
     }
 
     #[test]
