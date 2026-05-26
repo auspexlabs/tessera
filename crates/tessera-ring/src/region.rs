@@ -33,15 +33,31 @@ use crate::SectionConfig;
 /// Holds the caller-supplied section configuration plus a precomputed
 /// `section_data_offsets` table so slot accessors are O(1) instead of
 /// O(section_count) per call.
+///
+/// **Canonical section order**: regardless of the order the caller
+/// passes sections to `create` / `attach`, the library stores them
+/// sorted ascending by `section_id` internally. The on-disk
+/// `SectionHeader` table is stamped in this canonical order too. This
+/// makes two peers with the same sections-by-id interoperable even if
+/// they pass the list in different orders (e.g., one passes
+/// `[(0, ...), (7, ...)]` and the other passes `[(7, ...), (0, ...)]`).
+/// Codex P1 fix on PR #2 commit 9d7817b.
 pub struct Region {
     shmem: Shmem,
+    /// Canonical (sorted-by-section_id) section list. Distinct from
+    /// whatever order the caller supplied.
     sections: Vec<SectionConfig>,
-    /// Maps caller-supplied `section_id` → ordinal index into `sections`.
-    /// `section_id` need not be dense (0..N); the on-disk table is.
+    /// Maps caller-supplied `section_id` → ordinal index into the
+    /// canonical `sections` Vec.
     section_id_to_ordinal: HashMap<u32, u32>,
     /// `section_data_offsets[ordinal]` is the byte offset where this
-    /// section's slot array starts inside the mapped region.
+    /// section's slot array starts inside the mapped region, in
+    /// canonical order.
     section_data_offsets: Vec<usize>,
+    /// POSIX SHM segment name (e.g. `/tessera-ring-<hex>`). Stored so
+    /// `Region::unlink` can call `shm_unlink` without re-deriving from
+    /// the namespace handle. Codex P2 fix on PR #2 commit 9d7817b.
+    shm_name: String,
     is_owner: bool,
 }
 
@@ -76,7 +92,15 @@ impl Region {
     ) -> Result<Self> {
         validate_section_config(sections)?;
 
-        let pairs: Vec<(u32, u32)> = sections
+        // Codex P1 fix on PR #2 / commit 9d7817b: canonicalize section
+        // order by section_id so two peers passing the same sections in
+        // different list orders still interoperate. The on-disk header
+        // table is stamped in canonical order; the caller's input order
+        // doesn't matter.
+        let mut canonical: Vec<SectionConfig> = sections.to_vec();
+        canonical.sort_by_key(|s| s.section_id());
+
+        let pairs: Vec<(u32, u32)> = canonical
             .iter()
             .map(|s| (s.slot_count(), s.slot_size_bytes()))
             .collect();
@@ -85,7 +109,7 @@ impl Region {
                 "region size overflow across {} sections (per-section \
                 slot_count * slot_size_bytes exceeds usize::MAX). Reduce \
                 slot_count or slot_size_bytes.",
-                sections.len()
+                canonical.len()
             ))
         })?;
         let name = handle.shm_name();
@@ -126,18 +150,19 @@ impl Region {
         };
 
         let (section_id_to_ordinal, section_data_offsets) =
-            build_section_lookup_tables(sections);
+            build_section_lookup_tables(&canonical);
 
         let epoch_micros = current_epoch_micros();
         let mut region = Region {
             shmem,
-            sections: sections.to_vec(),
+            sections: canonical.clone(),
             section_id_to_ordinal,
             section_data_offsets,
+            shm_name: name,
             is_owner: true,
         };
         region.write_global_header(handle, epoch_micros);
-        for (ordinal, cfg) in sections.iter().enumerate() {
+        for (ordinal, cfg) in canonical.iter().enumerate() {
             let sh = SectionHeader {
                 section_id: cfg.section_id(),
                 slot_count: cfg.slot_count(),
@@ -162,6 +187,14 @@ impl Region {
     pub fn attach(handle: &NamespaceHandle, sections: &[SectionConfig]) -> Result<Self> {
         validate_section_config(sections)?;
 
+        // Codex P1 fix on PR #2 / commit 9d7817b: canonicalize section
+        // order by section_id. The on-disk header table is in
+        // canonical order; sorting the caller's input makes the
+        // ordinal-by-ordinal validation succeed regardless of input
+        // ordering.
+        let mut canonical: Vec<SectionConfig> = sections.to_vec();
+        canonical.sort_by_key(|s| s.section_id());
+
         let name = handle.shm_name();
         let shmem = ShmemConf::new()
             .os_id(&name)
@@ -182,7 +215,7 @@ impl Region {
         // global-header + section-header validation will catch the
         // semantic mismatch; this length check is purely about
         // bounds-safety before the first unsafe copy.
-        let pairs: Vec<(u32, u32)> = sections
+        let pairs: Vec<(u32, u32)> = canonical
             .iter()
             .map(|s| (s.slot_count(), s.slot_size_bytes()))
             .collect();
@@ -190,7 +223,7 @@ impl Region {
             TesseraRingError::Config(format!(
                 "region size overflow across {} sections (caller's per-section \
                 slot_count * slot_size_bytes exceeds usize::MAX)",
-                sections.len()
+                canonical.len()
             ))
         })?;
         if shmem.len() < expected_size {
@@ -202,18 +235,19 @@ impl Region {
                 peer, wrong namespace handle, or caller's section config doesn't match the \
                 creator's. Bailing out before any raw byte access (Codex P1 #2).",
                 GlobalHeader::SIZE,
-                sections.len(),
+                canonical.len(),
                 shmem.len()
             )));
         }
 
         let (section_id_to_ordinal, section_data_offsets) =
-            build_section_lookup_tables(sections);
+            build_section_lookup_tables(&canonical);
         let region = Region {
             shmem,
-            sections: sections.to_vec(),
+            sections: canonical,
             section_id_to_ordinal,
             section_data_offsets,
+            shm_name: name,
             is_owner: false,
         };
         region.validate_attached_global_header(handle)?;
@@ -736,11 +770,60 @@ impl Region {
 
     // --- Cleanup ---------------------------------------------------
 
-    /// Unlink the underlying SHM segment. Should be called by the
-    /// owner at clean shutdown; attachers must NOT call this. Drop
-    /// also unlinks owner-side automatically via `shared_memory`'s
-    /// default ownership model.
+    /// Explicit owner-side unlink of the SHM segment by name.
+    ///
+    /// Calling this removes the POSIX SHM name from the system; any
+    /// subsequent `Region::attach` from another process will fail.
+    /// Existing mappings (this `Region` and any concurrent attached
+    /// peers) remain valid until they drop, because POSIX `shm_unlink`
+    /// removes the name without unmapping live mappings.
+    ///
+    /// Idempotent: calling unlink twice (or on a name that's already
+    /// gone) is safe; OS errors are swallowed because this is
+    /// best-effort cleanup.
+    ///
+    /// Codex P2 fix on PR #2 (commit 9d7817b) — previously this was a
+    /// no-op despite the "should be called by the owner at clean
+    /// shutdown" docstring, which was misleading.
+    ///
+    /// # Restrictions
+    ///
+    /// Non-owners (attachers) MUST NOT call this; doing so removes the
+    /// name out from under the creating owner. Returns `OwnerOnly`-shaped
+    /// error... actually Ring's TesseraRingError doesn't have OwnerOnly
+    /// (Ring is symmetric multi-writer/multi-reader), but we still
+    /// reject attacher-side calls here as a Region error to enforce the
+    /// lifecycle contract.
     pub fn unlink(&mut self) -> Result<()> {
+        if !self.is_owner {
+            return Err(TesseraRingError::Region(
+                "Region::unlink called by an attacher (is_owner=false). Only the \
+                creator may unlink the shared-memory name. Drop this Region to \
+                release the attacher's mapping; the creator decides when to unlink."
+                    .into(),
+            ));
+        }
+        // Direct call to libc::shm_unlink with the stored name. The
+        // `unlink_named_region` helper does the same thing but also
+        // tries to open+drop first; that's unnecessary here since the
+        // owner already has the mapping live.
+        #[cfg(unix)]
+        {
+            let cname = std::ffi::CString::new(self.shm_name.as_str()).map_err(|_| {
+                TesseraRingError::Region(
+                    "stored shm_name contains an interior NUL byte (cannot happen \
+                    in practice — namespace handles produce hex-only names)"
+                        .into(),
+                )
+            })?;
+            // SAFETY: cname is a valid NUL-terminated C string;
+            // shm_unlink is thread-safe POSIX. Return value is
+            // ignored because this is best-effort idempotent cleanup
+            // (ENOENT is normal on the second call).
+            unsafe {
+                libc::shm_unlink(cname.as_ptr());
+            }
+        }
         Ok(())
     }
 }
@@ -1270,6 +1353,91 @@ mod tests {
         assert!(matches!(refused, Err(TesseraRingError::Region(_))));
         // With force_recreate it succeeds.
         let _second = Region::create(&handle, &sections, true).expect("force_recreate");
+    }
+
+    #[test]
+    fn creator_and_attacher_with_different_list_order_interoperate() {
+        // Codex P1 fix on PR #2 commit 9d7817b: section order in the
+        // caller's input list must not affect interop. Two peers using
+        // the same (section_id, slot_count, slot_size) tuples but
+        // passing them in different orders should attach successfully.
+        let handle = unique_handle("section-order-interop");
+        let creator_sections = vec![
+            SectionConfig::new(0, 4, 256),
+            SectionConfig::new(7, 8, 128),
+            SectionConfig::new(3, 4, 64),
+        ];
+        let mut creator = Region::create(&handle, &creator_sections, false).expect("create");
+
+        // Attacher passes the same sections in REVERSED order.
+        let attacher_sections = vec![
+            SectionConfig::new(3, 4, 64),
+            SectionConfig::new(7, 8, 128),
+            SectionConfig::new(0, 4, 256),
+        ];
+        let attacher = Region::attach(&handle, &attacher_sections).expect("attach");
+
+        // Both should resolve section_id 7 to the same canonical
+        // ordinal (the one stamped on disk), and both should be able
+        // to read/write the same slots.
+        let creator_ord = creator.section_ordinal(7).unwrap();
+        let attacher_ord = attacher.section_ordinal(7).unwrap();
+        assert_eq!(
+            creator_ord, attacher_ord,
+            "section_id 7 must map to the same canonical ordinal on both sides"
+        );
+
+        // Cross-process round-trip: creator writes section 7, attacher reads it back.
+        creator.write_slot_payload(creator_ord, 0, b"hello via reordered config").unwrap();
+        let read = attacher
+            .read_slot_payload(attacher_ord, 0, b"hello via reordered config".len() as u32)
+            .unwrap();
+        assert_eq!(read.as_slice(), b"hello via reordered config");
+    }
+
+    #[test]
+    fn unlink_removes_shm_name_for_owner() {
+        // Codex P2 fix on PR #2 commit 9d7817b: Region::unlink must
+        // actually call shm_unlink for owners (not be a documented
+        // no-op). Verify by calling unlink, then trying to attach from
+        // a fresh attacher — the attempt must fail because the SHM
+        // name is gone.
+        let handle = unique_handle("explicit-unlink");
+        let sections = vec![SectionConfig::new(0, 4, 64)];
+        let mut owner = Region::create(&handle, &sections, false).expect("create");
+        // Before unlink: attach succeeds (region is reachable by name).
+        let _attacher = Region::attach(&handle, &sections).expect("attach pre-unlink");
+        // Explicit unlink.
+        owner.unlink().expect("unlink");
+        // After unlink: a fresh attacher cannot find the name.
+        let post_attach = Region::attach(&handle, &sections);
+        assert!(
+            post_attach.is_err(),
+            "expected attach to fail after explicit unlink, got Ok"
+        );
+        // Idempotent: second unlink is safe.
+        owner.unlink().expect("second unlink");
+    }
+
+    #[test]
+    fn unlink_rejects_attacher_calls() {
+        // Only the creator may unlink. Attacher-side unlink would yank
+        // the name out from under the live creator — that's an API
+        // misuse the lifecycle contract forbids.
+        let handle = unique_handle("attacher-unlink-rejected");
+        let sections = vec![SectionConfig::new(0, 4, 64)];
+        let _creator = Region::create(&handle, &sections, false).expect("create");
+        let mut attacher = Region::attach(&handle, &sections).expect("attach");
+        let err = attacher.unlink().unwrap_err();
+        match err {
+            TesseraRingError::Region(msg) => {
+                assert!(
+                    msg.contains("attacher") || msg.contains("Only the creator"),
+                    "expected attacher-rejection error, got: {msg}"
+                );
+            }
+            other => panic!("expected Region error, got {other:?}"),
+        }
     }
 
     #[test]
