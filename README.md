@@ -8,10 +8,13 @@
 > **Status (pre-v0.1):** Tessera is being extracted from a set of
 > multi-process tools we've been running in production. All four
 > components have now landed — the three primitives (Pool, Ring,
-> Channel) and the Sink composite service over them — and we'll remove
-> this banner once everything is integrated back into our own
-> environment and validated end-to-end. Until then, expect rapid
-> iteration and occasional API churn.
+> Channel) and the Sink composite service over them. The open-source
+> posture pass and the v0.1.0 release (crates.io + PyPI) are
+> **deferred** until the extracted code has been re-imported and
+> validated in our next production version end-to-end; that re-import
+> test is the gate for tagging v0.1.0 and removing this banner. Until
+> then, expect rapid iteration and occasional API churn, and treat the
+> crates as not-yet-published.
 
 A *tessera* is the small tile that fills a slot in a mosaic. Each component
 in this library hands out tesserae — typed slot-tokens — backed by shared
@@ -125,7 +128,13 @@ cores and PyO3 facades have landed per the staged plan:
 | 4b | Ring — Rust core + PyO3 facade | done |
 | 4c | Channel — Rust core + PyO3 facade | done |
 | 4d | Sink — Rust core + PyO3 facade + `tessera-sink-worker` bin (composite over Pool + Channel) | done |
-| 5 | Open-source posture pass (API isolation audit, README docs, examples) and v0.1.0 release to crates.io + PyPI | pending |
+| 6 | Consume the extracted crates back into the next production version and validate the re-import end-to-end | next |
+| 5 | Open-source posture pass (API isolation audit, README docs, examples) and v0.1.0 release to crates.io + PyPI | **deferred** until the Stage-6 re-import test passes |
+
+Stages 5 and 6 are intentionally ordered re-import-first: the public
+v0.1.0 release is gated on the extracted code proving itself once
+re-imported into our production pipeline, so the API churns there
+rather than after a public tag.
 
 Track the plan in the upstream Certus repo:
 `claudedocs/plans/mp_tools_open_source_extraction_2026-05-23.md` in
