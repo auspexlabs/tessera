@@ -51,6 +51,8 @@ pub mod config;
 pub mod error;
 pub mod messages;
 pub mod names;
+pub mod sink;
+pub mod spawn;
 pub mod worker;
 
 // Re-export the underlying primitives so a consumer can pull the
@@ -60,4 +62,5 @@ pub use tessera_pool;
 
 pub use config::SinkConfig;
 pub use error::{Result, TesseraSinkError};
+pub use sink::Sink;
 pub use worker::{run_worker, WorkerParams};

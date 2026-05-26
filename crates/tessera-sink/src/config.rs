@@ -133,25 +133,31 @@ impl SinkConfig {
     }
 }
 
+/// A valid baseline config for use in tests across the crate.
+#[cfg(test)]
+pub(crate) fn tests_support_config() -> SinkConfig {
+    SinkConfig {
+        description: "tessera-sink-test/cfg".into(),
+        worker_count: 2,
+        pool_slot_count: 8,
+        pool_slot_size_bytes: 64 * 1024,
+        ttl_micros: 60_000_000,
+        acquire_timeout_micros: 5_000_000,
+        control_slot_count: 64,
+        control_slot_size_bytes: 4096,
+        ack_slot_count: 256,
+        ack_slot_size_bytes: 4096,
+        worker_bin_path: None,
+        force_recreate: false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn valid() -> SinkConfig {
-        SinkConfig {
-            description: "tessera-sink-test/cfg".into(),
-            worker_count: 2,
-            pool_slot_count: 8,
-            pool_slot_size_bytes: 64 * 1024,
-            ttl_micros: 60_000_000,
-            acquire_timeout_micros: 5_000_000,
-            control_slot_count: 64,
-            control_slot_size_bytes: 4096,
-            ack_slot_count: 256,
-            ack_slot_size_bytes: 4096,
-            worker_bin_path: None,
-            force_recreate: false,
-        }
+        tests_support_config()
     }
 
     #[test]
