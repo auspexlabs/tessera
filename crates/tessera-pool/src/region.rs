@@ -482,6 +482,29 @@ impl Region {
                 // a successful unlink.
             }
         }
+        // Sibling to Codex Ring PR #5 P2 (Ring commit 8fe2de3,
+        // comment 3305574604): on non-Unix platforms POSIX
+        // shm_unlink is unavailable. Without this early-return arm,
+        // the state-flip below would run unconditionally —
+        // unlink() would claim success without removing the OS
+        // name AND disable drop-time cleanup AND block future
+        // retries, leaking the name forever. Bail out explicitly so
+        // the caller knows unlink isn't supported on this platform
+        // and the Region remains in a recoverable state (Shmem's
+        // drop-time cleanup still active).
+        #[cfg(not(unix))]
+        {
+            return Err(TesseraPoolError::Region(
+                "Region::unlink is not supported on non-Unix platforms (POSIX \
+                shm_unlink unavailable). Drop the Region to let the underlying \
+                shared_memory crate's drop-time cleanup attempt removal."
+                    .into(),
+            ));
+        }
+        // Below this point we're guaranteed to be on Unix AND the
+        // shm_unlink call succeeded (or returned ENOENT). State flip
+        // only happens once both gates are clear.
+        //
         // Codex P1 on PR #4 iter-1 (comment 3304769711): suppress
         // the Shmem's drop-time unlink. Without this, a
         // handoff/restart sequence (owner A unlinks, owner B creates
@@ -492,10 +515,13 @@ impl Region {
         // Codex iter-4 (comment 3305006943): only reached after
         // shm_unlink succeeded (or returned ENOENT). On real
         // failure we early-returned above without touching state.
-        self.shmem.set_owner(false);
-        // Block any future unlink() call from this Region (Codex
-        // iter-3 fix). Subsequent calls hit the early-return above.
-        self.manually_unlinked = true;
+        #[cfg(unix)]
+        {
+            self.shmem.set_owner(false);
+            // Block any future unlink() call from this Region (Codex
+            // iter-3 fix). Subsequent calls hit the early-return above.
+            self.manually_unlinked = true;
+        }
         Ok(())
     }
 }
