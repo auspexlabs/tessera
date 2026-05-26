@@ -20,11 +20,13 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![allow(dead_code)]
 
+pub mod channel;
 pub mod error;
 pub mod header;
 pub mod namespace;
 pub mod region;
 
+pub use channel::Channel;
 pub use error::{ChannelRoleSnapshot, Result, TesseraChannelError};
 pub use namespace::NamespaceHandle;
 
@@ -90,8 +92,3 @@ pub struct ChannelConfig {
     pub force_recreate: bool,
 }
 
-/// Channel handle. Opaque to consumers; concrete fields and the
-/// state machine land in follow-up commits.
-pub struct Channel {
-    _placeholder: (),
-}
