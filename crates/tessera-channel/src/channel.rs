@@ -23,9 +23,24 @@ use crate::{ChannelConfig, ChannelRole};
 /// How many bounded-spin iterations the Sender / Receiver attempt
 /// before yielding to the OS scheduler. Spin is cheap on contention
 /// that resolves in microseconds (e.g. multiple senders racing on
-/// the same fetch_add window); yielding is appropriate when the
+/// the same CAS window); yielding is appropriate when the
 /// counterparty isn't making forward progress.
 const SPIN_BUDGET_BEFORE_YIELD: u32 = 64;
+
+/// Classification of a single receive attempt, so the public recv
+/// family can choose blocking vs non-blocking behavior without the
+/// shared helper spinning internally.
+enum RecvOutcome {
+    /// A message was dequeued; head advanced past it.
+    Got(Vec<u8>),
+    /// `head == tail` — the queue has no claimed slots.
+    Empty,
+    /// `head < tail` (the head slot has been claimed by a sender)
+    /// but the slot's `ready` flag isn't set yet — sender is
+    /// mid-write or stalled. Returned WITHOUT spinning so `try_recv`
+    /// fails fast; `recv` / `recv_timeout` drive their own wait loop.
+    NotReady,
+}
 
 /// Tessera Channel handle. Wraps a shared `Region` and exposes the
 /// MPSC queue API. The handle's role (Receiver vs Sender) is fixed
@@ -173,58 +188,69 @@ impl Channel {
     ///
     /// Internal helper shared by `send`, `try_send`, and
     /// `send_timeout`.
+    ///
+    /// Codex PR #8 P1 fix (channel.rs:190): the previous version did
+    /// an unconditional `fetch_add(tail)` AFTER a separate fullness
+    /// pre-check. Two concurrent senders could both pass the check
+    /// with only one slot free; the loser claimed a wrapped slot and
+    /// either blocked (violating try_send's non-blocking contract)
+    /// or raced an in-flight writer. The fix is a CAS loop that
+    /// re-checks capacity against `head` and only commits the claim
+    /// via `compare_exchange` — so capacity reservation and the tail
+    /// increment are atomic together.
     fn try_send_inner(&self, bytes: &[u8]) -> Result<bool> {
         let slot_count = self.region.slot_count() as u64;
-        let head = self.region.head_atomic().load(Ordering::Acquire);
-        let tail = self.region.tail_atomic().load(Ordering::Acquire);
-        if tail.wrapping_sub(head) >= slot_count {
-            return Ok(false);
-        }
-        // Claim the slot via CAS-equivalent fetch_add. If multiple
-        // senders are racing, they each get a unique position. A
-        // pathological case: between our head/tail read above and
-        // the fetch_add, the queue fills up — fetch_add ALWAYS
-        // succeeds (it's unconditional) so we could end up
-        // overwriting a slot the receiver hasn't drained yet. Guard
-        // against that with a post-claim check.
-        let claimed = self.region.tail_atomic().fetch_add(1, Ordering::AcqRel);
-        // Re-check: did we just claim a slot that's still occupied?
-        // If so, give it back by NOT marking it ready — the Receiver
-        // won't dequeue an unready slot. Callers retry.
-        //
-        // Actually a more aggressive defense: spin until the slot's
-        // `ready` is clear (Receiver has dequeued the prior cycle).
-        // This is correct under MPSC because:
-        //   - the slot at `claimed % slot_count` was last used at
-        //     position `claimed - slot_count` (the previous wrap)
-        //   - the Receiver clears `ready` AFTER advancing head past
-        //     that position
-        //   - so if head > claimed - slot_count, the prior writer's
-        //     payload has been consumed and the slot is reusable
-        let slot_index = (claimed % slot_count) as u32;
-        let ready = self.region.slot_ready_atomic(slot_index)?;
-        let seq = self.region.slot_sequence_atomic(slot_index)?;
-        // Wait for the slot to be reusable: the previous cycle's
-        // Receiver must have cleared `ready`. Under normal flow this
-        // is immediate (the head/tail check above already proves
-        // it). The wait protects against the edge case where head
-        // advanced just past the gate but the Receiver hasn't yet
-        // cleared the slot's ready flag.
-        let mut spin = 0u32;
-        while ready.load(Ordering::Acquire) != 0 {
-            spin += 1;
-            if spin > SPIN_BUDGET_BEFORE_YIELD {
-                std::thread::yield_now();
-                spin = 0;
-            } else {
-                core::hint::spin_loop();
+        let tail_atomic = self.region.tail_atomic();
+        let head_atomic = self.region.head_atomic();
+
+        // CAS-claim: atomically reserve capacity + increment tail.
+        // Only the sender that wins the CAS for a given `tail` value
+        // owns that position; losers retry with a fresh load. A
+        // sender NEVER claims beyond `slot_count` outstanding slots.
+        let claimed = loop {
+            let tail = tail_atomic.load(Ordering::Acquire);
+            let head = head_atomic.load(Ordering::Acquire);
+            if tail.wrapping_sub(head) >= slot_count {
+                // Genuinely full at this instant — no claim made, so
+                // try_send can fail-fast and send/send_timeout can
+                // wait + retry. Non-blocking contract preserved.
+                return Ok(false);
             }
-        }
+            match tail_atomic.compare_exchange_weak(
+                tail,
+                tail.wrapping_add(1),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break tail,
+                Err(_) => {
+                    // Another sender advanced tail between our load
+                    // and CAS. Retry with a fresh capacity check.
+                    core::hint::spin_loop();
+                    continue;
+                }
+            }
+        };
+
+        let slot_index = (claimed % slot_count) as u32;
+        let seq = self.region.slot_sequence_atomic(slot_index)?;
+        let ready = self.region.slot_ready_atomic(slot_index)?;
+
+        // No ready-spin needed. The CAS capacity check guarantees
+        // `claimed - head < slot_count`, i.e. `claimed - slot_count
+        // < head`. The slot at `claimed % slot_count` was last
+        // written at position `claimed - slot_count`; the Receiver
+        // clears that slot's `ready` BEFORE advancing `head` past
+        // `claimed - slot_count`. Our Acquire-load of `head` in the
+        // CAS loop synchronizes-with the Receiver's Release-store of
+        // `head`, so the cleared `ready` (and consumed payload) are
+        // visible to us. The slot is reusable.
 
         // Write payload + metadata. SAFETY: we hold the slot
-        // exclusively — claimed via unique fetch_add result, and the
-        // `ready == 0` check above guarantees no Receiver is mid-read
-        // on this slot from a prior cycle.
+        // exclusively — the CAS guarantees a unique outstanding
+        // claim per slot (no two senders own the same slot at once),
+        // and the capacity argument above guarantees no Receiver is
+        // mid-read on this slot from a prior cycle.
         let timestamp = current_nanos();
         unsafe {
             let dst = self.region.slot_payload_ptr_mut(slot_index)?;
@@ -232,13 +258,10 @@ impl Channel {
             self.region
                 .write_slot_metadata(slot_index, bytes.len() as u32, timestamp)?;
         }
-        // Stamp sequence FIRST (Release: pairs with Receiver's
-        // Acquire on sequence), then ready (Release: pairs with
-        // Receiver's Acquire on ready). Ordering matters: if
-        // Receiver observes ready==1 but sequence still 0 (stale),
-        // it would treat the slot as belonging to position 0
-        // instead of our `claimed`. The two stores below ensure
-        // sequence is durable before ready is set.
+        // Stamp sequence FIRST (Release), then ready (Release).
+        // Ordering: a Receiver observing ready==1 must also observe
+        // the matching sequence (and the payload). The ready store
+        // is the linearization point that publishes the slot.
         seq.store(claimed, Ordering::Release);
         ready.store(1, Ordering::Release);
         Ok(true)
@@ -258,38 +281,52 @@ impl Channel {
     }
 
     /// Dequeue one message. Blocks until a Sender enqueues if the
-    /// Channel is empty.
+    /// Channel is empty (or the head slot's producer is mid-write).
     ///
     /// Role: must be opened as `Receiver`.
     pub fn recv(&self) -> Result<Vec<u8>> {
         self.require_role(ChannelRole::Receiver)?;
         loop {
-            if let Some(msg) = self.try_recv_inner()? {
-                return Ok(msg);
-            }
-            for _ in 0..SPIN_BUDGET_BEFORE_YIELD {
-                if !self.is_empty() {
-                    break;
+            match self.try_recv_inner()? {
+                RecvOutcome::Got(msg) => return Ok(msg),
+                // Empty (head == tail) OR NotReady (head < tail but
+                // producer hasn't published the slot yet): block.
+                RecvOutcome::Empty | RecvOutcome::NotReady => {
+                    for _ in 0..SPIN_BUDGET_BEFORE_YIELD {
+                        if !self.is_empty() {
+                            break;
+                        }
+                        core::hint::spin_loop();
+                    }
+                    std::thread::yield_now();
                 }
-                core::hint::spin_loop();
-            }
-            if self.is_empty() {
-                std::thread::yield_now();
             }
         }
     }
 
     /// Non-blocking dequeue. Returns `Err(ChannelEmpty)` if no
-    /// message is available at the moment of the call.
+    /// message is currently receivable — either the queue is truly
+    /// empty (`head == tail`) OR the head slot has been claimed by a
+    /// sender that hasn't finished publishing yet (`head < tail` but
+    /// `ready == 0`). In both cases the call returns promptly without
+    /// blocking.
+    ///
+    /// Codex PR #8 P1 fix (channel.rs:342): the previous shared
+    /// helper spun unboundedly waiting for `ready`, so a sender that
+    /// stalled after `fetch_add(tail)` but before publishing would
+    /// make `try_recv` block forever — breaking the non-blocking
+    /// contract. `try_recv` now treats an unready head slot as
+    /// not-currently-receivable and returns immediately.
     ///
     /// Role: must be opened as `Receiver`.
     pub fn try_recv(&self) -> Result<Vec<u8>> {
         self.require_role(ChannelRole::Receiver)?;
-        if let Some(msg) = self.try_recv_inner()? {
-            Ok(msg)
-        } else {
-            let head = self.region.head_atomic().load(Ordering::Acquire);
-            Err(TesseraChannelError::ChannelEmpty { head })
+        match self.try_recv_inner()? {
+            RecvOutcome::Got(msg) => Ok(msg),
+            RecvOutcome::Empty | RecvOutcome::NotReady => {
+                let head = self.region.head_atomic().load(Ordering::Acquire);
+                Err(TesseraChannelError::ChannelEmpty { head })
+            }
         }
     }
 
@@ -300,79 +337,77 @@ impl Channel {
         self.require_role(ChannelRole::Receiver)?;
         let deadline = Instant::now() + timeout;
         loop {
-            if let Some(msg) = self.try_recv_inner()? {
-                return Ok(msg);
-            }
-            if Instant::now() >= deadline {
-                return Err(TesseraChannelError::Timeout {
-                    timeout_micros: timeout.as_micros() as u64,
-                    head: self.region.head_atomic().load(Ordering::Acquire),
-                    tail: self.region.tail_atomic().load(Ordering::Acquire),
-                });
-            }
-            for _ in 0..SPIN_BUDGET_BEFORE_YIELD {
-                if !self.is_empty() {
-                    break;
+            match self.try_recv_inner()? {
+                RecvOutcome::Got(msg) => return Ok(msg),
+                RecvOutcome::Empty | RecvOutcome::NotReady => {
+                    if Instant::now() >= deadline {
+                        return Err(TesseraChannelError::Timeout {
+                            timeout_micros: timeout.as_micros() as u64,
+                            head: self.region.head_atomic().load(Ordering::Acquire),
+                            tail: self.region.tail_atomic().load(Ordering::Acquire),
+                        });
+                    }
+                    for _ in 0..SPIN_BUDGET_BEFORE_YIELD {
+                        if !self.is_empty() {
+                            break;
+                        }
+                        core::hint::spin_loop();
+                    }
+                    std::thread::yield_now();
                 }
-                core::hint::spin_loop();
-            }
-            if self.is_empty() {
-                std::thread::yield_now();
             }
         }
     }
 
-    /// Attempt one receive. Returns `Ok(Some(bytes))` on dequeue,
-    /// `Ok(None)` if the queue was empty (caller decides what to do).
-    fn try_recv_inner(&self) -> Result<Option<Vec<u8>>> {
+    /// Attempt one receive, classifying the result so callers can
+    /// choose blocking vs non-blocking behavior:
+    ///   - `Got(bytes)` — a message was dequeued; head advanced.
+    ///   - `Empty` — `head == tail`; the queue has no claimed slots.
+    ///   - `NotReady` — `head < tail` (a sender claimed the head
+    ///     slot) but the slot's `ready` flag isn't set yet (sender
+    ///     is mid-write or stalled). Crucially this returns WITHOUT
+    ///     spinning, so `try_recv` can fail-fast.
+    ///
+    /// FIFO is preserved: the Receiver only ever looks at the slot
+    /// at `head % slot_count`; it never skips ahead to a later slot
+    /// that happens to be ready while the head slot isn't.
+    fn try_recv_inner(&self) -> Result<RecvOutcome> {
         let slot_count = self.region.slot_count() as u64;
         let head = self.region.head_atomic().load(Ordering::Acquire);
         let tail = self.region.tail_atomic().load(Ordering::Acquire);
         if head >= tail {
-            return Ok(None);
+            return Ok(RecvOutcome::Empty);
         }
         let slot_index = (head % slot_count) as u32;
         let ready = self.region.slot_ready_atomic(slot_index)?;
-        let seq = self.region.slot_sequence_atomic(slot_index)?;
-
-        // Spin briefly waiting for the producer to set `ready`. A
-        // claiming sender may have fetch_add'd tail past our head
-        // but not yet completed the payload copy + ready store.
-        let mut spin = 0u32;
-        while ready.load(Ordering::Acquire) == 0 {
-            spin += 1;
-            if spin > SPIN_BUDGET_BEFORE_YIELD {
-                // Producer is slow / stalled. Yield and come back
-                // — but DON'T treat the slot as empty (head < tail
-                // means a sender claimed it; we just need to wait).
-                std::thread::yield_now();
-                spin = 0;
-                // If something changed (e.g., the slot got reclaimed
-                // by a force-flush in v0.2), re-check head/tail. For
-                // v0.1 we just keep waiting.
-            } else {
-                core::hint::spin_loop();
-            }
+        if ready.load(Ordering::Acquire) == 0 {
+            // A sender claimed this slot (head < tail) but hasn't
+            // published it yet. Do NOT spin here — return NotReady so
+            // try_recv fails fast and recv / recv_timeout drive the
+            // wait loop at their own level.
+            return Ok(RecvOutcome::NotReady);
         }
 
         // Sequence sanity check: the slot's stamped sequence must
-        // match our expected head. If it doesn't, something has
-        // gone wrong (stale slot from a wrapped writer that didn't
-        // wait for ready==0, or memory corruption). Return an error
-        // surface — better to surface than to deliver wrong data.
+        // match our expected head. A mismatch indicates a protocol
+        // violation (a wrapped sender that didn't observe ready=0,
+        // or memory corruption). Fail fast rather than deliver wrong
+        // data. With the CAS-based sender claim this should never
+        // occur.
+        let seq = self.region.slot_sequence_atomic(slot_index)?;
         let observed_seq = seq.load(Ordering::Acquire);
         if observed_seq != head {
             return Err(TesseraChannelError::Region(format!(
                 "slot sequence mismatch at head {head}: slot[{slot_index}].sequence \
                 = {observed_seq}; expected {head}. Indicates a stale write from a \
                 wrapped sender that didn't observe ready=0 — should not occur \
-                with the current Sender protocol. Failing fast."
+                with the current CAS-based Sender protocol. Failing fast."
             )));
         }
 
         // SAFETY: ready == 1 and sequence == head confirmed; the
-        // producer's writes (payload + metadata) are visible to us
-        // via the ready Release → Acquire pairing.
+        // producer's writes (payload + metadata) are visible via the
+        // ready Release → Acquire pairing.
         let (length, _ts) = unsafe { self.region.read_slot_metadata(slot_index)? };
         let cap = self.region.slot_size_bytes();
         let copy_len = length.min(cap) as usize;
@@ -382,14 +417,14 @@ impl Channel {
             core::ptr::copy_nonoverlapping(src, payload.as_mut_ptr(), copy_len);
         }
 
-        // Clear ready (Release: pairs with Sender's Acquire on the
-        // next cycle's `ready == 0` check). Then advance head so
+        // Clear ready (Release: pairs with the next-cycle Sender's
+        // capacity-check Acquire on head). Then advance head so
         // subsequent recv calls move forward.
         ready.store(0, Ordering::Release);
         self.region
             .head_atomic()
             .store(head + 1, Ordering::Release);
-        Ok(Some(payload))
+        Ok(RecvOutcome::Got(payload))
     }
 
     /// Snapshot of `(head, tail)` for diagnostics. Not part of the
@@ -441,6 +476,114 @@ mod tests {
         })
         .expect("sender open");
         (receiver, sender)
+    }
+
+    #[test]
+    fn try_recv_returns_promptly_when_head_slot_claimed_but_not_ready() {
+        // Codex PR #8 P1 fix (channel.rs:342) regression: simulate a
+        // sender that claimed the head slot (incremented tail) but
+        // stalled before publishing (ready stays 0). try_recv must
+        // return ChannelEmpty PROMPTLY, not spin forever.
+        use crate::namespace::NamespaceHandle;
+        use crate::region::Region;
+        use std::sync::atomic::Ordering;
+
+        let desc = unique_description("try-recv-not-ready");
+        let receiver = Channel::open(ChannelConfig {
+            description: desc.clone(),
+            slot_count: 4,
+            slot_size_bytes: 16,
+            role: ChannelRole::Receiver,
+            force_recreate: false,
+        })
+        .expect("receiver open");
+
+        // Reach the same SHM via a directly-attached Region and
+        // increment tail without publishing — exactly the
+        // "sender claimed but stalled" state.
+        let handle = NamespaceHandle::derive(&desc);
+        let region = Region::attach(&handle, 4, 16).expect("attach region");
+        region.tail_atomic().fetch_add(1, Ordering::SeqCst);
+
+        // head == 0, tail == 1: head < tail but slot 0 ready == 0.
+        let start = std::time::Instant::now();
+        let err = receiver.try_recv().unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(err, TesseraChannelError::ChannelEmpty { .. }),
+            "expected ChannelEmpty, got {err:?}"
+        );
+        assert!(
+            elapsed.as_secs() < 1,
+            "try_recv must return promptly on not-ready head slot; took {elapsed:?}"
+        );
+
+        drop(region);
+    }
+
+    #[test]
+    fn tight_ring_concurrent_senders_no_overcommit_or_corruption() {
+        // Codex PR #8 P1 fix (channel.rs:190) regression: a tight
+        // ring (slot_count=2) with many concurrent senders maximizes
+        // capacity-contention. With the old unconditional fetch_add,
+        // two senders could both pass the fullness pre-check and
+        // overcommit, producing sequence mismatches / lost messages.
+        // With the CAS-based claim, every message arrives intact.
+        use std::thread;
+
+        const N_PRODUCERS: u32 = 6;
+        const N_PER_PRODUCER: u32 = 200;
+
+        let desc = unique_description("tight-ring-mpsc");
+        let slot_count = 2; // brutally tight: only 2 outstanding at once
+        let slot_size = 16;
+
+        let receiver = Channel::open(ChannelConfig {
+            description: desc.clone(),
+            slot_count,
+            slot_size_bytes: slot_size,
+            role: ChannelRole::Receiver,
+            force_recreate: false,
+        })
+        .expect("receiver open");
+
+        let producers: Vec<_> = (0..N_PRODUCERS)
+            .map(|pid| {
+                let desc = desc.clone();
+                thread::spawn(move || {
+                    let sender = Channel::open(ChannelConfig {
+                        description: desc,
+                        slot_count,
+                        slot_size_bytes: slot_size,
+                        role: ChannelRole::Sender,
+                        force_recreate: false,
+                    })
+                    .expect("sender open");
+                    for i in 0..N_PER_PRODUCER {
+                        let mut p = [0u8; 8];
+                        p[..4].copy_from_slice(&pid.to_le_bytes());
+                        p[4..].copy_from_slice(&i.to_le_bytes());
+                        sender.send(&p).expect("send");
+                    }
+                })
+            })
+            .collect();
+
+        let total = (N_PRODUCERS * N_PER_PRODUCER) as usize;
+        let mut seen = std::collections::HashSet::new();
+        while seen.len() < total {
+            let msg = receiver.recv().expect("recv");
+            assert_eq!(msg.len(), 8);
+            let pid = u32::from_le_bytes(msg[..4].try_into().unwrap());
+            let seq = u32::from_le_bytes(msg[4..].try_into().unwrap());
+            assert!(pid < N_PRODUCERS, "pid {pid} out of range — overcommit corruption?");
+            assert!(seq < N_PER_PRODUCER, "seq {seq} out of range — overcommit corruption?");
+            assert!(seen.insert((pid, seq)), "duplicate ({pid}, {seq})");
+        }
+        for h in producers {
+            h.join().expect("producer join");
+        }
+        assert_eq!(seen.len(), total, "every message must arrive exactly once");
     }
 
     #[test]
