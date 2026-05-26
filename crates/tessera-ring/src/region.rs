@@ -860,16 +860,41 @@ impl Region {
                 // the state-flip below as a successful unlink.
             }
         }
+        // Codex P2 on PR #5 (comment 3305574604): on non-Unix
+        // platforms, POSIX shm_unlink is unavailable. Without an
+        // early return here, the state flip below would run
+        // unconditionally — unlink() would claim success without
+        // removing the OS name AND disable drop-time cleanup AND
+        // block future retries, leaking the name forever. Bail out
+        // explicitly so the caller knows unlink isn't supported on
+        // this platform and the Region remains in a recoverable
+        // state (Shmem's drop-time cleanup still active).
+        #[cfg(not(unix))]
+        {
+            return Err(TesseraRingError::Region(
+                "Region::unlink is not supported on non-Unix platforms (POSIX \
+                shm_unlink unavailable). Drop the Region to let the underlying \
+                shared_memory crate's drop-time cleanup attempt removal."
+                    .into(),
+            ));
+        }
+        // Below this point we're guaranteed to be on Unix AND the
+        // shm_unlink call succeeded (or returned ENOENT). State flip
+        // only happens once both gates are clear.
+        //
         // Mirrors Pool PR #4 iter-1 (commit b18b95a, Codex comment
         // 3304769711): suppress the Shmem's drop-time unlink so a
         // handoff/restart sequence (owner A unlinks, owner B creates
         // fresh region with same name, then A finally drops) does
         // NOT have A's drop call shm_unlink AGAIN and remove B's
         // freshly-created name.
-        self.shmem.set_owner(false);
-        // Block any future unlink() call from this Region (iter-3
-        // pattern). Subsequent calls hit the early-return above.
-        self.manually_unlinked = true;
+        #[cfg(unix)]
+        {
+            self.shmem.set_owner(false);
+            // Block any future unlink() call from this Region (iter-3
+            // pattern). Subsequent calls hit the early-return above.
+            self.manually_unlinked = true;
+        }
         Ok(())
     }
 }
