@@ -1,13 +1,19 @@
 # Tessera examples
 
-**Status**: v0.0.1 scaffold. The example files below are placeholders;
-they're populated in Stage 4 alongside the corresponding component
-implementations.
+Runnable cross-component demos. Each prints what it's doing and asserts
+the expected outcome, so a clean exit means the demo passed.
 
-| File | Demonstrates | Lands in |
-|---|---|---|
-| `pool_intra_container.py` | Single-container Pool usage: owner process + child workers sharing one SHM region by fork inheritance. | Stage 4a |
-| `pool_paired_containers/` | Two-container Pool deployment with compose `ipc:` namespace sharing. `docker-compose.yml` + `producer.py` + `consumer.py` + `README.md`. | Stage 4a |
-| `ring_broadcast.py` | Multi-reader broadcast — one writer, three concurrent readers, each tracking its own drop count. | Stage 4b |
-| `sink_atomic_write.py` | Basic Sink usage: submit `(path, bytes)`; verify atomic on-disk rename. | Stage 4c |
-| `sink_with_pool_handoff.py` | Cross-component demo: Sink producer acquires Pool leases, hands descriptors to worker subprocesses, owner-side lease renewal during long writes. | Stage 4c |
+Run from the workspace root after installing the relevant package
+(`maturin develop` from the matching `python/py-tessera-*/` directory).
+The Sink examples additionally need the worker binary:
+`cargo build -p tessera-sink-worker`.
+
+| File | Demonstrates |
+|---|---|
+| `pool_intra_container.py` | Single-container Pool: owner process + worker subprocess sharing one SHM region by BLAKE3-derived description; lease → write → descriptor handoff → read → release. |
+| `ring_intra_container.py` | Single-container Ring: one writer, one reader, per-reader cursor + drop accounting. |
+| `ring_broadcast.py` | Multi-reader broadcast — one writer, several concurrent readers, each tracking its own drop count. |
+| `channel_intra_container.py` | Non-lossy MPSC Channel: receiver (parent) + sender (subprocess), FIFO drain. |
+| `channel_mpsc.py` | N producer subprocesses → one consumer, exercising multi-producer `tail` contention. |
+| `sink_atomic_write.py` | Sink basics: submit several `(path, bytes)` jobs across worker subprocesses, flush, verify each file is byte-exact on disk. |
+| `sink_chunked_streaming.py` | One large payload streamed as many chunks through few Pool slots — the owner recycles slots via worker acks; worker reassembles + BLAKE3-verifies before the atomic rename. |

@@ -38,10 +38,11 @@
 //! (§3.5.c single-writer-lease), not a reader — workers attach and
 //! read payloads via descriptors handed across the control channel.
 //!
-//! Stage 4d (in progress): error + config + region-name derivation
-//! land first; the control / ack message codec, worker run loop, and
-//! owner state machine land in follow-up commits, mirroring the
-//! Pool / Ring / Channel multi-commit cadence.
+//! The owner ([`Sink`]) is single-threaded by necessity (Pool/Channel
+//! wrap a `!Send` `Shmem`): it cooperatively drains the ack plane and
+//! renews leases inside `submit` / `flush`. Worker subprocesses are
+//! spawned via [`spawn::build_worker_command`] (the `tessera-sink-worker`
+//! bin) and run [`run_worker`].
 
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]

@@ -2,16 +2,16 @@
 
 > Open-source multi-process primitives for Python and Rust:
 > **Pool** (lease-backed shared-memory slots), **Ring** (lossy mmap-backed broadcast),
-> **Sink** (atomic-write worker pool over Pool).
+> **Channel** (non-lossy MPSC queue), and **Sink** (atomic-write worker pool
+> composed over Pool + Channel).
 
 > **Status (pre-v0.1):** Tessera is being extracted from a set of
-> multi-process tools we've been running in production. The port is
-> nearly complete — Pool and Ring have landed, Sink (and a non-lossy
-> Channel primitive used by Sink) are the remaining pieces — and we'll
-> remove this banner once everything is wired up, integrated back into
-> our own environment, and validated end-to-end. Until then, expect
-> rapid iteration and occasional API churn on the still-in-flight
-> components.
+> multi-process tools we've been running in production. All four
+> components have now landed — the three primitives (Pool, Ring,
+> Channel) and the Sink composite service over them — and we'll remove
+> this banner once everything is integrated back into our own
+> environment and validated end-to-end. Until then, expect rapid
+> iteration and occasional API churn.
 
 A *tessera* is the small tile that fills a slot in a mosaic. Each component
 in this library hands out tesserae — typed slot-tokens — backed by shared
@@ -87,7 +87,8 @@ Python facades on top of Rust cores.
 |---|---|---|---|
 | [`tessera-pool`](crates/tessera-pool/) | [`tessera-pool`](https://pypi.org/project/tessera-pool/) | No | Non-lossy lease-backed shared-memory pool. Fixed slots, single-owner lifecycle, single-writer-lease, timeout reclaim with slot-generation invalidation of stale handles. For transactional large payloads. |
 | [`tessera-ring`](crates/tessera-ring/) | [`tessera-ring`](https://pypi.org/project/tessera-ring/) | Yes | Lossy mmap-backed multi-writer / multi-reader ring buffer. Per-section write cursors with seqlock counters, caller-supplied sections, per-reader local cursors with gap detection. For telemetry-shaped streams. |
-| [`tessera-sink`](crates/tessera-sink/) | [`tessera-sink`](https://pypi.org/project/tessera-sink/) | No | Atomic-write worker pool to disk, built on `tessera-pool` for SHM zero-copy handoff. Owner-held leases with worker ack/cancel channels, chunked streaming with worker affinity, atomic temp+rename, XXHash integrity. |
+| [`tessera-channel`](crates/tessera-channel/) | [`tessera-channel`](https://pypi.org/project/tessera-channel/) | No | Non-lossy MPSC shared-memory queue. Multiple senders (CAS-claim on `tail`), one receiver, FIFO ordering, blocking / try / timeout modes. For control / RPC / ack planes. |
+| [`tessera-sink`](crates/tessera-sink/) | [`tessera-sink`](https://pypi.org/project/tessera-sink/) | No | Atomic-write worker pool to disk — a *composite service* over `tessera-pool` (zero-copy chunk handoff) and `tessera-channel` (control + ack planes). Owner-held leases with worker ack/cancel, chunked streaming with worker affinity, atomic temp+rename, BLAKE3 integrity. Worker subprocesses spawned via the `tessera-sink-worker` bin. |
 
 Each Rust crate has a thin Python facade in [`python/`](python/) built
 with [PyO3](https://pyo3.rs) / [maturin](https://www.maturin.rs).
@@ -115,26 +116,27 @@ with [PyO3](https://pyo3.rs) / [maturin](https://www.maturin.rs).
 
 ## Status
 
-**v0.0.1 — scaffold only.** The workspace builds (`cargo check
---workspace` passes) but implementations are placeholder structs. The
-core implementations land per the staged plan:
+**v0.0.1 — all components implemented; pre-v0.1 hardening.** The Rust
+cores and PyO3 facades have landed per the staged plan:
 
-| Stage | What |
-|---|---|
-| 4a | Pool — Rust core + PyO3 facade |
-| 4b | Ring — Rust core + PyO3 facade |
-| 4c | Sink — Rust core + PyO3 facade (depends on Pool) |
-| 5 | Open-source posture pass (API isolation audit, README docs, examples) and v0.1.0 release to crates.io + PyPI |
+| Stage | What | Status |
+|---|---|---|
+| 4a | Pool — Rust core + PyO3 facade | done |
+| 4b | Ring — Rust core + PyO3 facade | done |
+| 4c | Channel — Rust core + PyO3 facade | done |
+| 4d | Sink — Rust core + PyO3 facade + `tessera-sink-worker` bin (composite over Pool + Channel) | done |
+| 5 | Open-source posture pass (API isolation audit, README docs, examples) and v0.1.0 release to crates.io + PyPI | pending |
 
 Track the plan in the upstream Certus repo:
 `claudedocs/plans/mp_tools_open_source_extraction_2026-05-23.md` in
 [Indubitable-Industries/Bayence-Certus](https://github.com/Indubitable-Industries/Bayence-Certus).
 
-## Quick start (future, v0.1.0+)
+## Quick start (API preview; installable at v0.1.0)
 
 ```python
 from tessera_pool import Pool
 from tessera_ring import Ring
+from tessera_channel import Channel
 from tessera_sink import Sink
 
 # Non-lossy SHM pool — transactional large payloads
@@ -151,8 +153,14 @@ with Ring(sections={"logs": {"slot_count": 4096, "slot_size_bytes": 2048}},
     for event in ring.reader("log-drainer", section="logs").poll():
         ...
 
-# Atomic-write pool — chunked Pool-backed disk writes
-with Sink(worker_count=4, pool_description="my-app/artifacts") as sink:
+# Non-lossy MPSC queue — control / RPC / ack planes
+with Channel(slot_count=256, slot_size_bytes=4096,
+             description="my-app/control", role="receiver") as chan:
+    msg = chan.recv()
+
+# Atomic-write worker pool — chunked Pool-backed disk writes
+with Sink(description="my-app/artifacts", worker_count=4,
+          pool_slot_count=8, pool_slot_size_bytes=64 * 1024 * 1024) as sink:
     sink.submit("/path/to/output.bin", payload_bytes, fsync=True)
     sink.flush()
 ```
@@ -167,10 +175,13 @@ tessera/
 ├── crates/                   # pure Rust cores (usable from Rust without Python)
 │   ├── tessera-pool/
 │   ├── tessera-ring/
-│   └── tessera-sink/
-├── python/                   # PyO3 facades (one per Rust crate)
+│   ├── tessera-channel/
+│   ├── tessera-sink/
+│   └── tessera-sink-worker/  # worker executable spawned by tessera-sink
+├── python/                   # PyO3 facades (one per primitive + Sink)
 │   ├── py-tessera-pool/
 │   ├── py-tessera-ring/
+│   ├── py-tessera-channel/
 │   └── py-tessera-sink/
 ├── examples/                 # cross-component demos (populated in Stage 4+)
 └── .github/workflows/        # CI: cargo check / cargo test / maturin build
