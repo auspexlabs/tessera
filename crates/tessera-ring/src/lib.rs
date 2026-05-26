@@ -14,8 +14,11 @@
 
 pub mod error;
 pub mod header;
+pub mod namespace;
+pub mod region;
 
 pub use error::{Result, TesseraRingError};
+pub use namespace::NamespaceHandle;
 
 /// Per-section configuration supplied by the caller at `Ring::open`.
 ///
