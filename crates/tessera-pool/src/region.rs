@@ -70,7 +70,12 @@ impl Region {
             ));
         }
 
-        let size = region_size_bytes(slot_count, slot_size_bytes);
+        let size = region_size_bytes(slot_count, slot_size_bytes).ok_or_else(|| {
+            TesseraPoolError::Config(format!(
+                "region size overflow: slot_count={slot_count} * slot_size_bytes={slot_size_bytes} \
+                exceeds usize::MAX. Reduce one or both."
+            ))
+        })?;
         let name = handle.shm_name();
 
         let shmem = match ShmemConf::new().size(size).os_id(&name).create() {
@@ -119,8 +124,11 @@ impl Region {
         region.write_header(handle, epoch_micros, slot_count, slot_size_bytes, ttl_micros);
         // Slot table starts zeroed (Shmem create zeroes the mapping on
         // Linux), but be explicit about it: zero every SlotMeta entry.
+        // The `?` here propagates a bounds error; not reachable in
+        // practice because `i` is < slot_count by construction, but
+        // satisfies the new Result-returning signature.
         for i in 0..slot_count {
-            region.write_slot_meta(i, SlotMeta::zeroed());
+            region.write_slot_meta(i, SlotMeta::zeroed())?;
         }
         Ok(region)
     }
@@ -262,49 +270,81 @@ impl Region {
 
     // --- Slot metadata accessors -----------------------------------
 
-    /// Read a slot's metadata by index. O(1).
-    pub fn read_slot_meta(&self, slot_index: u32) -> SlotMeta {
-        debug_assert!(slot_index < self.slot_count);
+    /// Validate `slot_index < slot_count`. Used by every accessor
+    /// that performs `unsafe` pointer arithmetic so the bounds check
+    /// survives release builds (debug_assert is stripped at opt
+    /// levels 1+).
+    fn check_slot_index(&self, slot_index: u32) -> Result<()> {
+        if slot_index >= self.slot_count {
+            return Err(TesseraPoolError::Region(format!(
+                "slot_index {slot_index} out of range (slot_count={})",
+                self.slot_count
+            )));
+        }
+        Ok(())
+    }
+
+    /// Read a slot's metadata by index. O(1). Returns `Region` error
+    /// if `slot_index` is out of range.
+    pub fn read_slot_meta(&self, slot_index: u32) -> Result<SlotMeta> {
+        self.check_slot_index(slot_index)?;
         let offset = slot_meta_offset(slot_index);
         let mut meta = SlotMeta::zeroed();
         let meta_bytes = bytemuck::bytes_of_mut(&mut meta);
-        // SAFETY: offset + SIZE <= region size by construction.
+        // SAFETY: offset + SIZE <= region size — slot_index is
+        // verified < slot_count above, and slot_meta_offset(i)
+        // == HEADER_SIZE + i * SlotMeta::SIZE which is < region_size
+        // for any valid i.
         unsafe {
             let src = self.shmem.as_ptr().add(offset);
             core::ptr::copy_nonoverlapping(src, meta_bytes.as_mut_ptr(), SlotMeta::SIZE);
         }
-        meta
+        Ok(meta)
     }
 
-    /// Write a slot's metadata. Owner-only callers; not enforced here
-    /// because the Pool layer enforces it before calling in.
-    pub fn write_slot_meta(&mut self, slot_index: u32, meta: SlotMeta) {
-        debug_assert!(slot_index < self.slot_count);
+    /// Write a slot's metadata. Returns `Region` error if
+    /// `slot_index` is out of range. (Owner-only logically; not
+    /// enforced here because the Pool layer enforces single-writer-
+    /// lease before calling in.)
+    pub fn write_slot_meta(&mut self, slot_index: u32, meta: SlotMeta) -> Result<()> {
+        self.check_slot_index(slot_index)?;
         let offset = slot_meta_offset(slot_index);
         let meta_bytes = bytemuck::bytes_of(&meta);
-        // SAFETY: offset + SIZE <= region size; we hold &mut self so
-        // no other reader/writer is racing in this process.
+        // SAFETY: offset + SIZE <= region size (see read_slot_meta);
+        // we hold &mut self so no other reader/writer is racing in
+        // this process.
         unsafe {
             let dst = self.shmem.as_ptr().add(offset);
             core::ptr::copy_nonoverlapping(meta_bytes.as_ptr(), dst, SlotMeta::SIZE);
         }
+        Ok(())
     }
 
     // --- Slot payload accessors ------------------------------------
 
-    /// Copy `bytes` into slot `slot_index`'s payload area. Panics on
-    /// out-of-range index; the Pool layer rejects oversized payloads
-    /// before calling.
-    pub fn write_slot_payload(&mut self, slot_index: u32, bytes: &[u8]) {
-        debug_assert!(slot_index < self.slot_count);
-        debug_assert!(bytes.len() <= self.slot_size_bytes as usize);
+    /// Copy `bytes` into slot `slot_index`'s payload area. Returns
+    /// `Region` error if `slot_index` is out of range or `bytes`
+    /// exceeds the slot capacity (the Pool layer rejects oversized
+    /// payloads with `OversizedPayload` earlier in the chain; this
+    /// is defense in depth at the unsafe boundary).
+    pub fn write_slot_payload(&mut self, slot_index: u32, bytes: &[u8]) -> Result<()> {
+        self.check_slot_index(slot_index)?;
+        if bytes.len() > self.slot_size_bytes as usize {
+            return Err(TesseraPoolError::Region(format!(
+                "payload size {} exceeds slot capacity {}",
+                bytes.len(),
+                self.slot_size_bytes
+            )));
+        }
         let offset = slot_payload_offset(slot_index, self.slot_count, self.slot_size_bytes);
-        // SAFETY: payload region is within bounds by construction;
-        // we hold &mut self so no concurrent access in-process.
+        // SAFETY: slot_index verified in range, bytes.len() verified
+        // ≤ slot_size_bytes; we hold &mut self so no concurrent
+        // access in-process.
         unsafe {
             let dst = self.shmem.as_ptr().add(offset);
             core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
         }
+        Ok(())
     }
 
     /// Read a copy of slot `slot_index`'s payload bytes (first
@@ -427,7 +467,7 @@ mod tests {
         let handle = unique_handle("zero-slots");
         let region = Region::create(&handle, 3, 256, 30_000_000, false).expect("create");
         for i in 0..3 {
-            let meta = region.read_slot_meta(i);
+            let meta = region.read_slot_meta(i).expect("read");
             assert_eq!(meta.lease_id_high, 0);
             assert_eq!(meta.lease_id_low, 0);
             assert_eq!(meta.generation, 0);
@@ -497,8 +537,8 @@ mod tests {
             flags: flags::IN_USE | flags::PAYLOAD_FINALIZED,
             _reserved: [0; 32],
         };
-        region.write_slot_meta(1, meta);
-        let read = region.read_slot_meta(1);
+        region.write_slot_meta(1, meta).expect("write meta");
+        let read = region.read_slot_meta(1).expect("read meta");
         assert_eq!(read.lease_id_high, 0x1122_3344_5566_7788);
         assert_eq!(read.lease_id_low, 0x99AA_BBCC_DDEE_FF00);
         assert_eq!(read.generation, 7);
@@ -513,7 +553,7 @@ mod tests {
         let handle = unique_handle("payload-roundtrip");
         let mut region = Region::create(&handle, 2, 64, 30_000_000, false).expect("create");
         let payload: Vec<u8> = (0..32).collect();
-        region.write_slot_payload(0, &payload);
+        region.write_slot_payload(0, &payload).expect("write payload");
         let read = region.read_slot_payload(0, 32).expect("read");
         assert_eq!(read, payload);
         // Slot 1 was untouched.
@@ -529,7 +569,7 @@ mod tests {
         // derivation alone is sufficient to coordinate.
         let handle = unique_handle("cross-attach");
         let mut creator = Region::create(&handle, 4, 128, 60_000_000, false).expect("create");
-        creator.write_slot_payload(2, b"hello attacher");
+        creator.write_slot_payload(2, b"hello attacher").expect("write");
 
         let attacher = Region::attach(&handle, 4, 128).expect("attach");
         let read = attacher

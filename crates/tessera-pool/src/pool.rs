@@ -187,7 +187,7 @@ impl Pool {
         // concurrent owner-side reclaim sweep doesn't race the
         // generation bump.
         let _guard = state.slot_mutation_lock.lock();
-        let mut meta = self.region.read_slot_meta(slot_index);
+        let mut meta = self.region.read_slot_meta(slot_index)?;
         let lease_id = LeaseId::from_bytes(fresh_lease_id_bytes());
         meta.generation = meta.generation.wrapping_add(1);
         meta.lease_id_high = lease_id.high();
@@ -195,7 +195,7 @@ impl Pool {
         meta.acquired_at_micros = monotonic_micros();
         meta.payload_len = 0;
         meta.flags = flags::IN_USE;
-        self.region.write_slot_meta(slot_index, meta);
+        self.region.write_slot_meta(slot_index, meta)?;
 
         Ok(Lease::new(slot_index, lease_id, meta.generation))
     }
@@ -218,7 +218,7 @@ impl Pool {
         }
 
         let _guard = state.slot_mutation_lock.lock();
-        let mut meta = self.region.read_slot_meta(lease.slot_index());
+        let mut meta = self.region.read_slot_meta(lease.slot_index())?;
         validate_lease(lease, &meta)?;
         if meta.payload_finalized() {
             return Err(TesseraPoolError::WriteAfterFinalize {
@@ -227,10 +227,10 @@ impl Pool {
         }
 
         self.region
-            .write_slot_payload(lease.slot_index(), payload);
+            .write_slot_payload(lease.slot_index(), payload)?;
         meta.payload_len = payload.len() as u32;
         meta.flags |= flags::PAYLOAD_FINALIZED;
-        self.region.write_slot_meta(lease.slot_index(), meta);
+        self.region.write_slot_meta(lease.slot_index(), meta)?;
 
         Ok(Descriptor::new(
             lease.slot_index(),
@@ -263,7 +263,7 @@ impl Pool {
                 self.region.slot_count()
             )));
         }
-        let meta = self.region.read_slot_meta(slot_index);
+        let meta = self.region.read_slot_meta(slot_index)?;
         validate_descriptor(descriptor, &meta)?;
         // Descriptor size must match what was actually written. A
         // larger value would read past the written payload (potentially
@@ -298,7 +298,7 @@ impl Pool {
             .as_ref()
             .ok_or(TesseraPoolError::OwnerOnly)?;
         let _guard = state.slot_mutation_lock.lock();
-        let meta = self.region.read_slot_meta(lease.slot_index());
+        let meta = self.region.read_slot_meta(lease.slot_index())?;
         validate_lease(lease, &meta)?;
         // Clear meta — but DO NOT bump generation on a normal release.
         // Generation only bumps on acquire and reclaim_stale.
@@ -311,7 +311,7 @@ impl Pool {
             flags: 0,
             _reserved: [0; 32],
         };
-        self.region.write_slot_meta(lease.slot_index(), cleared);
+        self.region.write_slot_meta(lease.slot_index(), cleared)?;
         state.free_slots.push(lease.slot_index());
         Ok(())
     }
@@ -325,10 +325,10 @@ impl Pool {
             .as_ref()
             .ok_or(TesseraPoolError::OwnerOnly)?;
         let _guard = state.slot_mutation_lock.lock();
-        let mut meta = self.region.read_slot_meta(lease.slot_index());
+        let mut meta = self.region.read_slot_meta(lease.slot_index())?;
         validate_lease(lease, &meta)?;
         meta.acquired_at_micros = monotonic_micros();
-        self.region.write_slot_meta(lease.slot_index(), meta);
+        self.region.write_slot_meta(lease.slot_index(), meta)?;
         Ok(())
     }
 
@@ -348,7 +348,7 @@ impl Pool {
         let _guard = state.slot_mutation_lock.lock();
         let mut reclaimed = 0_u32;
         for i in 0..self.region.slot_count() {
-            let meta = self.region.read_slot_meta(i);
+            let meta = self.region.read_slot_meta(i)?;
             if !meta.in_use() {
                 continue;
             }
@@ -368,7 +368,7 @@ impl Pool {
                 flags: 0,
                 _reserved: [0; 32],
             };
-            self.region.write_slot_meta(i, cleared);
+            self.region.write_slot_meta(i, cleared)?;
             state.free_slots.push(i);
             reclaimed += 1;
         }
@@ -376,14 +376,14 @@ impl Pool {
     }
 
     /// Current count of leased (in-use) slots. Useful for monitoring.
-    pub fn in_use_count(&self) -> u32 {
+    pub fn in_use_count(&self) -> Result<u32> {
         let mut n = 0;
         for i in 0..self.region.slot_count() {
-            if self.region.read_slot_meta(i).in_use() {
+            if self.region.read_slot_meta(i)?.in_use() {
                 n += 1;
             }
         }
-        n
+        Ok(n)
     }
 
 }
@@ -476,18 +476,18 @@ mod tests {
     #[test]
     fn owner_can_acquire_and_release() {
         let mut pool = Pool::new(owner_config("acquire-release", 4, 256)).expect("new");
-        assert_eq!(pool.in_use_count(), 0);
+        assert_eq!(pool.in_use_count().expect("in_use"), 0);
 
         let lease1 = pool.acquire(Duration::from_secs(1)).expect("acquire 1");
         let lease2 = pool.acquire(Duration::from_secs(1)).expect("acquire 2");
-        assert_eq!(pool.in_use_count(), 2);
+        assert_eq!(pool.in_use_count().expect("in_use"), 2);
         assert_ne!(lease1.slot_index(), lease2.slot_index());
         assert_ne!(lease1.lease_id(), lease2.lease_id());
 
         pool.release(&lease1).expect("release 1");
-        assert_eq!(pool.in_use_count(), 1);
+        assert_eq!(pool.in_use_count().expect("in_use"), 1);
         pool.release(&lease2).expect("release 2");
-        assert_eq!(pool.in_use_count(), 0);
+        assert_eq!(pool.in_use_count().expect("in_use"), 0);
     }
 
     #[test]
@@ -575,7 +575,7 @@ mod tests {
 
         let reclaimed = pool.reclaim_stale().expect("reclaim");
         assert_eq!(reclaimed, 1);
-        assert_eq!(pool.in_use_count(), 0);
+        assert_eq!(pool.in_use_count().expect("in_use"), 0);
 
         // Original descriptor is now stale.
         let err = pool.read_payload(&descriptor).unwrap_err();
@@ -606,7 +606,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(30));
         let reclaimed = pool.reclaim_stale().expect("reclaim");
         assert_eq!(reclaimed, 0);
-        assert_eq!(pool.in_use_count(), 1);
+        assert_eq!(pool.in_use_count().expect("in_use"), 1);
 
         pool.release(&lease).expect("release");
     }

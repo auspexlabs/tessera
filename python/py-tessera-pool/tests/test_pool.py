@@ -65,6 +65,19 @@ def test_pool_construct_rejects_invalid_config(kwargs):
         Pool(**kwargs)
 
 
+def test_pool_construct_rejects_overflowing_region_size():
+    """Additional from sequential review: u32::MAX slots of u32::MAX
+    bytes would overflow usize on region size math. Region::create
+    surfaces this as a Config error before any shm_open."""
+    with pytest.raises(TesseraPoolError, match="overflow|exceeds usize"):
+        Pool(
+            description=_unique_description("region-overflow"),
+            slot_count=0xFFFFFFFF,
+            slot_size_bytes=0xFFFFFFFF,
+            ttl_seconds=10.0,
+        )
+
+
 # ---------------------------------------------------------------- acquire / release
 
 
@@ -289,6 +302,38 @@ def test_context_manager_releases_on_exit():
 
     with Pool(description=desc, slot_count=1, slot_size_bytes=64, ttl_seconds=10.0) as p2:
         assert p2.is_owner is True
+
+
+@pytest.mark.parametrize("bad_value", [float("inf"), float("-inf"), float("nan")])
+def test_acquire_rejects_nonfinite_timeout(bad_value):
+    """Codex iter-4 P2 regression: Duration::from_secs_f64 panics on
+    inf/NaN. Validate before conversion."""
+    desc = _unique_description("nonfinite-timeout")
+    with Pool(description=desc, slot_count=1, slot_size_bytes=64, ttl_seconds=10.0) as pool:
+        with pytest.raises(TesseraPoolError, match="finite|>= 0"):
+            pool.acquire(timeout_seconds=bad_value)
+
+
+def test_acquire_rejects_unreasonably_large_timeout():
+    """200 years in seconds — almost certainly a unit-conversion bug
+    (caller meant micros). Reject explicitly so the error message
+    points at the actual mistake instead of panicking later."""
+    desc = _unique_description("huge-timeout")
+    with Pool(description=desc, slot_count=1, slot_size_bytes=64, ttl_seconds=10.0) as pool:
+        with pytest.raises(TesseraPoolError, match="unreasonably large|unit conversion"):
+            pool.acquire(timeout_seconds=200 * 365.25 * 86400)
+
+
+@pytest.mark.parametrize("bad_value", [float("inf"), float("-inf"), float("nan"), 0.0, -1.0])
+def test_pool_new_rejects_invalid_ttl(bad_value):
+    """Codex iter-4 P2 generalized: ttl_seconds must be finite + > 0."""
+    with pytest.raises(TesseraPoolError, match="finite|> 0"):
+        Pool(
+            description=_unique_description(f"bad-ttl-{bad_value}"),
+            slot_count=1,
+            slot_size_bytes=64,
+            ttl_seconds=bad_value,
+        )
 
 
 def test_operations_on_closed_pool_raise():

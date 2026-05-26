@@ -31,6 +31,40 @@ fn map_err(e: RustPoolError) -> PyErr {
     TesseraPoolError::new_err(e.to_string())
 }
 
+/// Validate that a Python-supplied f64 seconds value is safe to convert
+/// to a Duration (or to multiply by 1e6 into u64 micros).
+///
+/// `Duration::from_secs_f64` panics on NaN, infinity, negative values,
+/// and values larger than Duration::MAX (~584 years). We catch all of
+/// those before they reach the Rust core. Zero is allowed iff
+/// `allow_zero` (true for timeouts, false for TTLs).
+fn validate_seconds(field: &str, value: f64, allow_zero: bool) -> PyResult<()> {
+    if !value.is_finite() {
+        return Err(TesseraPoolError::new_err(format!(
+            "{field} must be finite (got {value}); inf/NaN not allowed"
+        )));
+    }
+    let min_ok = if allow_zero { value >= 0.0 } else { value > 0.0 };
+    if !min_ok {
+        return Err(TesseraPoolError::new_err(format!(
+            "{field} must be {} (got {value})",
+            if allow_zero { ">= 0" } else { "> 0" }
+        )));
+    }
+    // 100 years in seconds = 3.155_692_6e9. Anything beyond this is
+    // almost certainly a unit-conversion bug at the caller (e.g. they
+    // passed micros instead of seconds). Bounded well under Duration::MAX
+    // so the subsequent `Duration::from_secs_f64` cannot panic.
+    const MAX_SECONDS: f64 = 100.0 * 365.25 * 86400.0;
+    if value > MAX_SECONDS {
+        return Err(TesseraPoolError::new_err(format!(
+            "{field} {value} is unreasonably large (max {MAX_SECONDS:.0}); \
+            check unit conversion (expected seconds, not micros / millis)"
+        )));
+    }
+    Ok(())
+}
+
 /// Owner-side lease handle. Returned by `Pool.acquire`. Read-only
 /// from Python; use as an opaque value.
 #[pyclass(name = "Lease", module = "tessera_pool", frozen)]
@@ -264,6 +298,10 @@ impl PyPool {
         force_recreate: bool,
     ) -> PyResult<Self> {
         let ttl_micros = if is_owner {
+            validate_seconds("ttl_seconds", ttl_seconds, /*allow_zero=*/ false)?;
+            // Safe: value is finite and within bounds (validate_seconds
+            // checked); multiplication by 1e6 stays well below u64::MAX
+            // (100 years in micros ≈ 3.15e15, far under u64::MAX 1.8e19).
             (ttl_seconds * 1_000_000.0).max(1.0) as u64
         } else {
             // Ignored on attach; underlying Pool::new inherits from
@@ -314,7 +352,7 @@ impl PyPool {
 
     /// Current count of leased slots. Useful for monitoring.
     fn in_use_count(&self) -> PyResult<u32> {
-        self.with_inner(|p| Ok(p.in_use_count()))
+        self.with_inner(|p| p.in_use_count())
     }
 
     /// True if the Pool has been closed (either via `close()` or by
@@ -328,7 +366,10 @@ impl PyPool {
     /// `timeout_seconds` for availability.
     #[pyo3(signature = (timeout_seconds=30.0))]
     fn acquire(&self, timeout_seconds: f64) -> PyResult<PyLease> {
-        let timeout = Duration::from_secs_f64(timeout_seconds.max(0.0));
+        validate_seconds("timeout_seconds", timeout_seconds, /*allow_zero=*/ true)?;
+        // Safe: validate_seconds confirmed value is finite and within
+        // Duration's safe range, so from_secs_f64 cannot panic.
+        let timeout = Duration::from_secs_f64(timeout_seconds);
         self.with_inner_mut(|p| p.acquire(timeout))
             .map(|inner| PyLease { inner })
     }

@@ -131,10 +131,18 @@ impl SlotMeta {
 /// Compute the total region size in bytes for the given slot config.
 ///
 /// Layout: `Header :: SlotMeta * slot_count :: payload(slot_size_bytes * slot_count)`.
-pub fn region_size_bytes(slot_count: u32, slot_size_bytes: u32) -> usize {
-    Header::SIZE
-        + SlotMeta::SIZE * (slot_count as usize)
-        + (slot_size_bytes as usize) * (slot_count as usize)
+///
+/// Returns `None` if the size would overflow `usize` — e.g. very large
+/// `slot_count * slot_size_bytes`. The Pool layer surfaces this as a
+/// `Config` error at construction so the caller fails fast rather than
+/// getting a confusing OS-level shm_open failure on a usize-wrapped
+/// size.
+pub fn region_size_bytes(slot_count: u32, slot_size_bytes: u32) -> Option<usize> {
+    let n = slot_count as usize;
+    let slot_size = slot_size_bytes as usize;
+    let slot_table = SlotMeta::SIZE.checked_mul(n)?;
+    let payload = slot_size.checked_mul(n)?;
+    Header::SIZE.checked_add(slot_table)?.checked_add(payload)
 }
 
 /// Offset (from region start) where the slot-metadata table begins.
@@ -211,7 +219,16 @@ mod tests {
         let n = 4_u32;
         let slot_size = 1024_u32;
         let expected = Header::SIZE + (n as usize) * SlotMeta::SIZE + (n as usize) * (slot_size as usize);
-        assert_eq!(region_size_bytes(n, slot_size), expected);
+        assert_eq!(region_size_bytes(n, slot_size), Some(expected));
+    }
+
+    #[test]
+    fn region_size_overflow_returns_none() {
+        // Pathological config: u32::MAX slots of u32::MAX bytes each.
+        // The multiplication overflows usize on 64-bit; checked path
+        // returns None instead of wrapping into a tiny value that
+        // would silently allocate a too-small SHM segment.
+        assert_eq!(region_size_bytes(u32::MAX, u32::MAX), None);
     }
 
     #[test]
