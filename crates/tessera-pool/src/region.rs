@@ -24,6 +24,11 @@ pub struct Region {
     shmem: Shmem,
     slot_count: u32,
     slot_size_bytes: u32,
+    /// POSIX SHM segment name (e.g. `/tessera-pool-<hex>`). Stored so
+    /// `Region::unlink` can call `shm_unlink` without re-deriving from
+    /// the namespace handle. Mirrors the Ring iter-3 fix on tessera-ring
+    /// commit 0e39176.
+    shm_name: String,
     is_owner: bool,
 }
 
@@ -119,6 +124,7 @@ impl Region {
             shmem,
             slot_count,
             slot_size_bytes,
+            shm_name: name,
             is_owner: true,
         };
         region.write_header(handle, epoch_micros, slot_count, slot_size_bytes, ttl_micros);
@@ -150,6 +156,7 @@ impl Region {
             shmem,
             slot_count: expected_slot_count,
             slot_size_bytes: expected_slot_size_bytes,
+            shm_name: name,
             is_owner: false,
         };
         region.validate_attached_header(handle, expected_slot_count, expected_slot_size_bytes)?;
@@ -382,16 +389,53 @@ impl Region {
 
     // --- Cleanup ---------------------------------------------------
 
-    /// Unlink the underlying SHM segment. Should be called by the
-    /// owner at clean shutdown; attachers must NOT call this.
+    /// Explicit owner-side unlink of the SHM segment by name.
+    ///
+    /// Calling this removes the POSIX SHM name from the system; any
+    /// subsequent `Region::attach` from another process will fail.
+    /// Existing mappings (this `Region` and any concurrent attached
+    /// peers) remain valid until they drop, because POSIX `shm_unlink`
+    /// removes the name without unmapping live mappings.
+    ///
+    /// Idempotent: calling unlink twice (or on a name that's already
+    /// gone) is safe; OS errors are swallowed because this is
+    /// best-effort cleanup.
+    ///
+    /// Mirrors the Ring iter-3 P2 fix on tessera-ring commit 0e39176
+    /// — previously this was a no-op despite the "should be called by
+    /// the owner at clean shutdown" docstring, which was misleading.
+    ///
+    /// # Restrictions
+    ///
+    /// Non-owners (attachers) MUST NOT call this; doing so removes
+    /// the name out from under the creating owner. Returns a `Region`
+    /// error in that case to enforce the lifecycle contract.
     pub fn unlink(&mut self) -> Result<()> {
-        // shared_memory crate auto-unlinks on Shmem drop IF the
-        // creator's `set_owner(true)` was set (the default for create()).
-        // For explicit early unlink we'd need to take ownership and
-        // drop. Since Shmem's drop already handles this for owners,
-        // this method is a no-op signal for the caller (and a hook
-        // for future refinement, e.g. shm_unlink even from attachers
-        // in test cleanup paths).
+        if !self.is_owner {
+            return Err(TesseraPoolError::Region(
+                "Region::unlink called by an attacher (is_owner=false). Only the \
+                creator may unlink the shared-memory name. Drop this Region to \
+                release the attacher's mapping; the creator decides when to unlink."
+                    .into(),
+            ));
+        }
+        #[cfg(unix)]
+        {
+            let cname = std::ffi::CString::new(self.shm_name.as_str()).map_err(|_| {
+                TesseraPoolError::Region(
+                    "stored shm_name contains an interior NUL byte (cannot happen \
+                    in practice — namespace handles produce hex-only names)"
+                        .into(),
+                )
+            })?;
+            // SAFETY: cname is a valid NUL-terminated C string;
+            // shm_unlink is thread-safe POSIX. Return value is
+            // ignored because this is best-effort idempotent cleanup
+            // (ENOENT is normal on the second call).
+            unsafe {
+                libc::shm_unlink(cname.as_ptr());
+            }
+        }
         Ok(())
     }
 }
@@ -576,5 +620,47 @@ mod tests {
             .read_slot_payload(2, b"hello attacher".len() as u32)
             .expect("read");
         assert_eq!(read.as_slice(), b"hello attacher");
+    }
+
+    #[test]
+    fn unlink_removes_shm_name_for_owner() {
+        // Mirrors the Ring iter-3 P2 fix. Region::unlink must actually
+        // call shm_unlink for owners; verify by calling unlink, then
+        // attempting a fresh attach — must fail because the SHM name
+        // is gone.
+        let handle = unique_handle("explicit-unlink");
+        let mut owner = Region::create(&handle, 4, 64, 60_000_000, false).expect("create");
+        // Before unlink: attach succeeds.
+        let _attacher = Region::attach(&handle, 4, 64).expect("attach pre-unlink");
+        // Explicit unlink.
+        owner.unlink().expect("unlink");
+        // After unlink: fresh attacher cannot find the name.
+        let post_attach = Region::attach(&handle, 4, 64);
+        assert!(
+            post_attach.is_err(),
+            "expected attach to fail after explicit unlink, got Ok"
+        );
+        // Idempotent: second unlink is safe.
+        owner.unlink().expect("second unlink");
+    }
+
+    #[test]
+    fn unlink_rejects_attacher_calls() {
+        // Only the creator may unlink. Attacher-side unlink would yank
+        // the name out from under the live creator — that's an API
+        // misuse the lifecycle contract forbids.
+        let handle = unique_handle("attacher-unlink-rejected");
+        let _creator = Region::create(&handle, 4, 64, 60_000_000, false).expect("create");
+        let mut attacher = Region::attach(&handle, 4, 64).expect("attach");
+        let err = attacher.unlink().unwrap_err();
+        match err {
+            TesseraPoolError::Region(msg) => {
+                assert!(
+                    msg.contains("attacher") || msg.contains("Only the creator"),
+                    "expected attacher-rejection error, got: {msg}"
+                );
+            }
+            other => panic!("expected Region error, got {other:?}"),
+        }
     }
 }
