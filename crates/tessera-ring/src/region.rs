@@ -13,6 +13,7 @@
 //! its sub-primitives.
 
 use std::collections::HashMap;
+use std::sync::atomic::AtomicU64;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytemuck::Zeroable;
@@ -480,6 +481,213 @@ impl Region {
         Ok(out)
     }
 
+    // --- Runtime atomic / raw-pointer accessors --------------------
+    //
+    // The seqlock state machine (see `crate::ring`) needs:
+    //   - atomic ops on `writer_position` (per section)
+    //   - atomic ops on per-slot `sequence`
+    //   - unsafe raw-pointer writes to slot payload + non-atomic
+    //     SlotHeader fields inside the seqlock-protected window
+    //
+    // All of these are `&self` (not `&mut self`) because the runtime
+    // path operates through `Arc<Region>` shared across threads / over
+    // the Writer/Reader handles. Memory safety is provided by:
+    //   * AtomicU64 for cross-thread synchronization on the sequence
+    //     and writer_position counters
+    //   * the seqlock protocol (odd-then-even sequence flips) ensuring
+    //     readers either see a complete slot or detect mid-write and
+    //     retry
+    //   * verified alignment: the mmap base is page-aligned and our
+    //     field offsets are 8-byte-aligned, so `&AtomicU64` casts are
+    //     well-formed
+
+    /// Byte offset of `writer_position` within `SectionHeader`.
+    ///
+    /// Layout: section_id(4) + slot_count(4) + slot_size_bytes(4)
+    /// + _pad0(4) = 16 bytes. The test
+    /// `writer_position_field_offset_matches_layout` locks this in.
+    const WRITER_POSITION_FIELD_OFFSET: usize = 16;
+
+    /// Byte offset of `sequence` within `SlotHeader`. First field, so 0.
+    const SEQUENCE_FIELD_OFFSET: usize = 0;
+
+    /// Byte offset of `position` within `SlotHeader`. After `sequence`.
+    const POSITION_FIELD_OFFSET: usize = 8;
+
+    /// Byte offset of `length` within `SlotHeader`.
+    /// sequence(8) + position(8) = 16.
+    const LENGTH_FIELD_OFFSET: usize = 16;
+
+    /// Byte offset of `timestamp_nanos` within `SlotHeader`.
+    /// sequence(8) + position(8) + length(4) + _pad0(4) = 24.
+    const TIMESTAMP_FIELD_OFFSET: usize = 24;
+
+    /// Atomic view of a section's `writer_position` counter.
+    ///
+    /// Used by `Writer::publish` to claim the next slot via fetch_add,
+    /// and by `Reader::poll` to observe the latest published position.
+    pub fn writer_position_atomic(&self, ordinal: u32) -> Result<&AtomicU64> {
+        self.check_ordinal(ordinal)?;
+        let offset = section_header_offset(ordinal) + Self::WRITER_POSITION_FIELD_OFFSET;
+        // SAFETY: offset is within bounds (section_header_offset(ordinal)
+        // is < sections_data_offset(section_count) by check_ordinal +
+        // dense table layout; adding 16 stays inside SectionHeader::SIZE
+        // == 64). Alignment: mmap base is page-aligned and offset is
+        // 8-aligned (section_header_offset is 64-aligned via
+        // GlobalHeader::SIZE == 128 + 64*k; adding 16 keeps 8-alignment).
+        // AtomicU64 has the same layout as u64.
+        unsafe {
+            let ptr = self.shmem.as_ptr().add(offset) as *const AtomicU64;
+            Ok(&*ptr)
+        }
+    }
+
+    /// Atomic view of a slot's `sequence` counter.
+    ///
+    /// Used by `Writer::publish` to stamp odd-then-even, and by
+    /// `Reader::poll` to check the seqlock state before / after copy.
+    pub fn slot_sequence_atomic(&self, ordinal: u32, slot_index: u32) -> Result<&AtomicU64> {
+        self.check_slot_index(ordinal, slot_index)?;
+        let offset = self.slot_offset(ordinal, slot_index) + Self::SEQUENCE_FIELD_OFFSET;
+        // SAFETY: slot_offset(ordinal, slot_index) lies inside this
+        // section's data area (verified by check_slot_index). Alignment:
+        // sections_data_offset is 8-aligned; slot_stride includes the
+        // 64-byte SlotHeader so successive slots remain 8-aligned as
+        // long as slot_size_bytes is a multiple of 8 — for v0.1 we don't
+        // enforce that, but the sequence field is at slot offset 0 which
+        // inherits the slot's start alignment (and slot starts are
+        // header-relative: slot k starts at section_data + k * stride
+        // where stride includes SlotHeader::SIZE == 64; alignment is
+        // preserved). If a caller picks an odd slot_size_bytes we'd
+        // still be safe at sequence (offset 0) but timestamp_nanos /
+        // position would no longer be 8-aligned. v0.1 acceptable because
+        // we only use AtomicU64 on sequence.
+        unsafe {
+            let ptr = self.shmem.as_ptr().add(offset) as *const AtomicU64;
+            Ok(&*ptr)
+        }
+    }
+
+    /// Raw mutable pointer to the start of slot's payload area. Used
+    /// by `Writer::publish` inside the seqlock-odd window to copy
+    /// caller bytes.
+    ///
+    /// # Safety
+    ///
+    /// Caller must hold the seqlock-odd state on this slot's `sequence`
+    /// counter so no reader sees mid-write data. `len` bytes from the
+    /// returned pointer must not exceed the section's `slot_size_bytes`.
+    pub unsafe fn slot_payload_ptr_mut(
+        &self,
+        ordinal: u32,
+        slot_index: u32,
+    ) -> Result<*mut u8> {
+        self.check_slot_index(ordinal, slot_index)?;
+        let offset = self.slot_payload_offset(ordinal, slot_index);
+        // SAFETY: caller-asserted seqlock protection; offset bounds
+        // verified by check_slot_index above.
+        Ok(unsafe { self.shmem.as_ptr().add(offset) })
+    }
+
+    /// Raw const pointer to the start of slot's payload area. Used by
+    /// `Reader::poll` inside the seqlock-check window to copy bytes
+    /// out.
+    ///
+    /// # Safety
+    ///
+    /// Caller must verify (via seqlock before/after sequence check)
+    /// that the slot's sequence is stable and even around the copy.
+    pub unsafe fn slot_payload_ptr(
+        &self,
+        ordinal: u32,
+        slot_index: u32,
+    ) -> Result<*const u8> {
+        self.check_slot_index(ordinal, slot_index)?;
+        let offset = self.slot_payload_offset(ordinal, slot_index);
+        Ok(unsafe { self.shmem.as_ptr().add(offset) as *const u8 })
+    }
+
+    /// Write the per-slot non-atomic header fields (`position`,
+    /// `length`, `timestamp_nanos`) inside the seqlock-odd window.
+    ///
+    /// `sequence` is NOT touched here — the caller manages the seqlock
+    /// counter via `slot_sequence_atomic` directly.
+    ///
+    /// # Safety
+    ///
+    /// Caller must hold the seqlock-odd state on the target slot.
+    pub unsafe fn write_slot_header_fields(
+        &self,
+        ordinal: u32,
+        slot_index: u32,
+        position: u64,
+        length: u32,
+        timestamp_nanos: u64,
+    ) -> Result<()> {
+        self.check_slot_index(ordinal, slot_index)?;
+        let slot_base = self.slot_offset(ordinal, slot_index);
+        // SAFETY: slot bounds verified; caller-asserted seqlock protection.
+        unsafe {
+            let base = self.shmem.as_ptr().add(slot_base);
+            core::ptr::write_unaligned(
+                base.add(Self::POSITION_FIELD_OFFSET) as *mut u64,
+                position,
+            );
+            core::ptr::write_unaligned(
+                base.add(Self::LENGTH_FIELD_OFFSET) as *mut u32,
+                length,
+            );
+            core::ptr::write_unaligned(
+                base.add(Self::TIMESTAMP_FIELD_OFFSET) as *mut u64,
+                timestamp_nanos,
+            );
+        }
+        Ok(())
+    }
+
+    /// Read the per-slot non-atomic header fields. Used by
+    /// `Reader::poll` between the before/after sequence checks.
+    ///
+    /// # Safety
+    ///
+    /// Caller must verify (via seqlock before/after sequence check)
+    /// that the read window is sequence-stable.
+    pub unsafe fn read_slot_header_fields(
+        &self,
+        ordinal: u32,
+        slot_index: u32,
+    ) -> Result<(u64, u32, u64)> {
+        self.check_slot_index(ordinal, slot_index)?;
+        let slot_base = self.slot_offset(ordinal, slot_index);
+        // SAFETY: slot bounds verified; caller-asserted seqlock check
+        // brackets the read window.
+        unsafe {
+            let base = self.shmem.as_ptr().add(slot_base);
+            let position = core::ptr::read_unaligned(
+                base.add(Self::POSITION_FIELD_OFFSET) as *const u64,
+            );
+            let length = core::ptr::read_unaligned(
+                base.add(Self::LENGTH_FIELD_OFFSET) as *const u32,
+            );
+            let timestamp = core::ptr::read_unaligned(
+                base.add(Self::TIMESTAMP_FIELD_OFFSET) as *const u64,
+            );
+            Ok((position, length, timestamp))
+        }
+    }
+
+    /// Return the slot's configured payload capacity (for the section
+    /// ordinal). Used by Writer to bounds-check caller bytes.
+    pub fn slot_capacity(&self, ordinal: u32) -> Result<u32> {
+        Ok(self.section_config(ordinal)?.slot_size_bytes())
+    }
+
+    /// Return the slot count for a section ordinal. Used by Writer to
+    /// compute `position % slot_count` and by Reader for gap math.
+    pub fn slot_count(&self, ordinal: u32) -> Result<u32> {
+        Ok(self.section_config(ordinal)?.slot_count())
+    }
+
     // --- Cleanup ---------------------------------------------------
 
     /// Unlink the underlying SHM segment. Should be called by the
@@ -850,6 +1058,102 @@ mod tests {
             .read_slot_payload(0, 2, b"hello attacher".len() as u32)
             .expect("read");
         assert_eq!(read.as_slice(), b"hello attacher");
+    }
+
+    #[test]
+    fn writer_position_field_offset_matches_layout() {
+        // Locks in WRITER_POSITION_FIELD_OFFSET against any accidental
+        // SectionHeader field shuffle. If you reorder SectionHeader's
+        // fields, this fails first — fix the constant or the layout
+        // before moving on.
+        let sh = SectionHeader::zeroed();
+        let base = &sh as *const SectionHeader as usize;
+        let field = &sh.writer_position as *const u64 as usize;
+        assert_eq!(field - base, Region::WRITER_POSITION_FIELD_OFFSET);
+    }
+
+    #[test]
+    fn slot_header_field_offsets_match_layout() {
+        let s = SlotHeader::zeroed();
+        let base = &s as *const SlotHeader as usize;
+        let sequence = &s.sequence as *const u64 as usize;
+        let position = &s.position as *const u64 as usize;
+        let length = &s.length as *const u32 as usize;
+        let timestamp = &s.timestamp_nanos as *const u64 as usize;
+        assert_eq!(sequence - base, Region::SEQUENCE_FIELD_OFFSET);
+        assert_eq!(position - base, Region::POSITION_FIELD_OFFSET);
+        assert_eq!(length - base, Region::LENGTH_FIELD_OFFSET);
+        assert_eq!(timestamp - base, Region::TIMESTAMP_FIELD_OFFSET);
+    }
+
+    #[test]
+    fn writer_position_atomic_starts_at_zero_and_supports_fetch_add() {
+        use std::sync::atomic::Ordering;
+        let handle = unique_handle("writer-pos-atomic");
+        let sections = vec![SectionConfig::new(0, 4, 64)];
+        let region = Region::create(&handle, &sections, false).expect("create");
+        let pos = region.writer_position_atomic(0).expect("atomic view");
+        assert_eq!(pos.load(Ordering::SeqCst), 0);
+        let first = pos.fetch_add(1, Ordering::SeqCst);
+        let second = pos.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(first, 0);
+        assert_eq!(second, 1);
+        assert_eq!(pos.load(Ordering::SeqCst), 2);
+        // Visible to a separate attach to the same region.
+        let attacher = Region::attach(&handle, &sections).expect("attach");
+        assert_eq!(
+            attacher
+                .writer_position_atomic(0)
+                .expect("attacher view")
+                .load(Ordering::SeqCst),
+            2
+        );
+    }
+
+    #[test]
+    fn slot_sequence_atomic_starts_at_zero() {
+        use std::sync::atomic::Ordering;
+        let handle = unique_handle("slot-seq-atomic");
+        let sections = vec![SectionConfig::new(0, 4, 64)];
+        let region = Region::create(&handle, &sections, false).expect("create");
+        for i in 0..4 {
+            let seq = region.slot_sequence_atomic(0, i).expect("seq view");
+            assert_eq!(seq.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn unsafe_payload_ptr_writes_visible_via_read_slot_payload() {
+        let handle = unique_handle("payload-ptr");
+        let sections = vec![SectionConfig::new(0, 2, 32)];
+        let region = Region::create(&handle, &sections, false).expect("create");
+        let data = b"hello via raw ptr";
+        // SAFETY: single-threaded test; no concurrent reader.
+        unsafe {
+            let dst = region.slot_payload_ptr_mut(0, 1).expect("ptr");
+            core::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
+        }
+        let read = region
+            .read_slot_payload(0, 1, data.len() as u32)
+            .expect("read");
+        assert_eq!(read.as_slice(), data);
+    }
+
+    #[test]
+    fn write_then_read_slot_header_fields_via_unsafe_path() {
+        let handle = unique_handle("header-fields-unsafe");
+        let sections = vec![SectionConfig::new(0, 2, 64)];
+        let region = Region::create(&handle, &sections, false).expect("create");
+        // SAFETY: single-threaded test; caller-asserted seqlock window.
+        unsafe {
+            region
+                .write_slot_header_fields(0, 1, 42, 7, 1_700_000_000_000_000_000)
+                .expect("write");
+            let (pos, len, ts) = region.read_slot_header_fields(0, 1).expect("read");
+            assert_eq!(pos, 42);
+            assert_eq!(len, 7);
+            assert_eq!(ts, 1_700_000_000_000_000_000);
+        }
     }
 
     #[test]
