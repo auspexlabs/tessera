@@ -3,9 +3,11 @@ resolver = "2"
 members = [
     "crates/tessera-pool",
     "crates/tessera-ring",
+    "crates/tessera-channel",
     "crates/tessera-sink",
     "python/py-tessera-pool",
     "python/py-tessera-ring",
+    "python/py-tessera-channel",
     "python/py-tessera-sink",
 ]
 
@@ -21,6 +23,7 @@ rust-version = "1.74"
 # Core crates (path references — become registry references at publish time)
 tessera-pool = { path = "crates/tessera-pool", version = "0.0.1" }
 tessera-ring = { path = "crates/tessera-ring", version = "0.0.1" }
+tessera-channel = { path = "crates/tessera-channel", version = "0.0.1" }
 tessera-sink = { path = "crates/tessera-sink", version = "0.0.1" }
 
 # Shared third-party

@@ -1,0 +1,17 @@
+[package]
+name = "py-tessera-channel"
+description = "Python bindings for tessera-channel (Tessera Channel)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "tessera_channel"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { workspace = true }
+tessera-channel = { workspace = true }
