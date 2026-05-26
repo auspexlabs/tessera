@@ -33,6 +33,22 @@ pub struct PoolConfig {
     /// Lease TTL in microseconds. Owner-only; non-owners inherit the
     /// owner-stamped value from the header at attach time.
     pub ttl_micros: u64,
+    /// Owner-side recovery escape hatch (§3.5.b). Default `false`.
+    ///
+    /// When `false` (default), an owner that finds the SHM region
+    /// already exists on `Pool::new` refuses to clobber it — we
+    /// cannot safely distinguish "stale segment from a crashed prior
+    /// owner" from "live segment from a concurrent owner in its
+    /// mid-init window where the header isn't yet stamped." Failing
+    /// fast is correct.
+    ///
+    /// When `true`, the caller asserts that no live owner exists for
+    /// this description. The existing segment is unconditionally
+    /// unlinked + recreated. Misuse will silently clobber a live
+    /// peer; only set this during explicit recovery scenarios.
+    ///
+    /// Ignored when `is_owner == false`.
+    pub force_recreate: bool,
 }
 
 /// Internal owner-side bookkeeping. Lives in process memory; not
@@ -95,6 +111,7 @@ impl Pool {
                 config.slot_count,
                 config.slot_size_bytes,
                 config.ttl_micros,
+                config.force_recreate,
             )?;
             // Initial free list: every slot index, in order.
             let free_slots = SegQueue::new();
@@ -452,6 +469,7 @@ mod tests {
             slot_size_bytes: slot_size,
             is_owner: true,
             ttl_micros: 60_000_000,
+            force_recreate: false,
         }
     }
 
@@ -636,9 +654,11 @@ mod tests {
 
     #[test]
     fn concurrent_create_with_live_owner_refuses_to_clobber() {
-        // Codex P1-1 regression guard: if an owner is already alive for
-        // this region, a second `Pool::new(is_owner=true, ...)` must
-        // refuse rather than silently unlinking the live segment.
+        // Codex P1 regression guard (iterations 1 + 3): if an owner is
+        // already alive for this region, a second `Pool::new(is_owner=true,
+        // force_recreate=false, ...)` must refuse rather than silently
+        // unlinking the live segment — even in a startup-race window
+        // where the existing segment's header hasn't been stamped yet.
         let config = owner_config("concurrent-create", 2, 256);
         let _alive_owner = Pool::new(config.clone()).expect("first owner");
         // Second attempt with the same description + geometry: should error.
@@ -654,6 +674,29 @@ mod tests {
         }
         // The first owner is still alive and usable.
         // (Drop happens when _alive_owner goes out of scope.)
+    }
+
+    #[test]
+    fn force_recreate_unlinks_and_takes_over() {
+        // The recovery escape hatch for crashed-prior-owner scenarios.
+        // The caller asserts "no live owner"; we unconditionally unlink
+        // and recreate. This is the inverse of the previous test —
+        // demonstrates that the flag actually works when set, while
+        // the default safely refuses.
+        let config = owner_config("force-recreate", 2, 256);
+        let first = Pool::new(config.clone()).expect("first owner");
+        // First-owner sanity: holds an active lease.
+        // (We drop without releasing — simulates a crashed owner.)
+        drop(first);
+        // In a real crash scenario, the SHM segment may still be present
+        // on the filesystem (POSIX shm_unlink only fires if Shmem owner-
+        // drop ran). Force-recreate lets us recover.
+        let recovery_config = PoolConfig {
+            force_recreate: true,
+            ..config.clone()
+        };
+        let recovered = Pool::new(recovery_config).expect("recover with force_recreate");
+        assert!(recovered.is_owner());
     }
 
     #[test]

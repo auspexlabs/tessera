@@ -248,14 +248,20 @@ impl PyPool {
     ///   vs attach to an existing one (`False`).
     /// - `ttl_seconds` (default `60.0`): lease TTL in seconds.
     ///   Ignored on attach (TTL is inherited from the SHM header).
+    /// - `force_recreate` (default `False`): owner-side recovery
+    ///   escape hatch for crashed-prior-owner scenarios. When True,
+    ///   the existing SHM segment is unconditionally unlinked and
+    ///   recreated. Misuse will silently clobber a live peer; only
+    ///   set this during explicit recovery. Ignored on attach.
     #[new]
-    #[pyo3(signature = (*, description, slot_count, slot_size_bytes, is_owner=true, ttl_seconds=60.0))]
+    #[pyo3(signature = (*, description, slot_count, slot_size_bytes, is_owner=true, ttl_seconds=60.0, force_recreate=false))]
     fn new(
         description: String,
         slot_count: u32,
         slot_size_bytes: u32,
         is_owner: bool,
         ttl_seconds: f64,
+        force_recreate: bool,
     ) -> PyResult<Self> {
         let ttl_micros = if is_owner {
             (ttl_seconds * 1_000_000.0).max(1.0) as u64
@@ -270,6 +276,7 @@ impl PyPool {
             slot_size_bytes,
             is_owner,
             ttl_micros,
+            force_recreate,
         };
         let pool = RustPool::new(config).map_err(map_err)?;
         Ok(Self {

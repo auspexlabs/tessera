@@ -42,11 +42,24 @@ impl Region {
     /// Owner path: create a fresh region, stamp the header with the
     /// caller's geometry + epoch + TTL + handle digest, zero the slot
     /// table.
+    ///
+    /// If the SHM segment already exists:
+    /// - Default (`force_recreate == false`): return an error. We do
+    ///   NOT try to inspect the existing segment, because a "looks
+    ///   invalid" verdict is racy — another owner may be mid-init,
+    ///   having created the segment but not yet stamped the header.
+    ///   Treating a zeroed-header window as "stale" would clobber a
+    ///   live segment. Operators recovering from a crashed prior
+    ///   owner must explicitly pass `force_recreate=true`.
+    /// - `force_recreate == true`: caller asserts no live owner.
+    ///   Unconditionally unlink + recreate. Misuse of this flag is
+    ///   the caller's responsibility.
     pub fn create(
         handle: &NamespaceHandle,
         slot_count: u32,
         slot_size_bytes: u32,
         ttl_micros: u64,
+        force_recreate: bool,
     ) -> Result<Self> {
         if slot_count == 0 {
             return Err(TesseraPoolError::Config("slot_count must be > 0".into()));
@@ -60,44 +73,36 @@ impl Region {
         let size = region_size_bytes(slot_count, slot_size_bytes);
         let name = handle.shm_name();
 
-        // Open exclusively. If the segment already exists, do NOT blindly
-        // unlink — that could detach another live owner's segment from
-        // its name and split participants across two regions. Instead:
-        // attach + validate the existing header. If it matches the
-        // caller's geometry + handle digest, refuse to clobber (another
-        // owner is presumably alive). If it fails validation (stale
-        // header from a crashed prior owner, different geometry,
-        // garbage bytes), unlink + recreate is safe.
         let shmem = match ShmemConf::new().size(size).os_id(&name).create() {
             Ok(shmem) => shmem,
             Err(ShmemError::LinkExists) | Err(ShmemError::MappingIdExists) => {
-                let probe_handle = handle.clone();
-                match Region::attach(&probe_handle, slot_count, slot_size_bytes) {
-                    Ok(_existing_valid) => {
-                        // Existing segment is structurally valid for our
-                        // geometry + handle. Refuse to clobber.
-                        return Err(TesseraPoolError::Region(format!(
-                            "Pool region '{name}' already exists with matching geometry; \
-                            another owner may be alive. Refusing to clobber. If this is \
-                            recovery from a crashed prior owner, manually shm_unlink the \
-                            segment first (e.g. `rm /dev/shm{name}`)."
-                        )));
-                    }
-                    Err(_validation_failed) => {
-                        // Existing segment doesn't match — stale, garbage, or
-                        // different geometry. Safe to unlink + recreate.
-                        let _ = unlink_named_region(&name);
-                        ShmemConf::new()
-                            .size(size)
-                            .os_id(&name)
-                            .create()
-                            .map_err(|e| {
-                                TesseraPoolError::Region(format!(
-                                    "create after unlink (existing segment failed \
-                                    validation): {e}"
-                                ))
-                            })?
-                    }
+                if force_recreate {
+                    // Operator-asserted recovery: no live owner exists,
+                    // unlink + recreate unconditionally. We do NOT
+                    // attach-validate first — that would re-introduce
+                    // the startup-race vulnerability where a brand-new
+                    // segment in the mid-init window looks "invalid"
+                    // because its header isn't stamped yet.
+                    let _ = unlink_named_region(&name);
+                    ShmemConf::new()
+                        .size(size)
+                        .os_id(&name)
+                        .create()
+                        .map_err(|e| {
+                            TesseraPoolError::Region(format!(
+                                "create after force_recreate unlink: {e}"
+                            ))
+                        })?
+                } else {
+                    return Err(TesseraPoolError::Region(format!(
+                        "Pool region '{name}' already exists. Refusing to clobber. \
+                        Possible causes: another owner is alive (do not create a \
+                        second), OR a prior owner crashed without unlinking. For \
+                        recovery from a crashed owner, retry with \
+                        `force_recreate=true` — but only after confirming no live \
+                        owner exists, since `force_recreate` will unconditionally \
+                        unlink the existing segment."
+                    )));
                 }
             }
             Err(e) => return Err(TesseraPoolError::Region(format!("create: {e}"))),
@@ -405,7 +410,7 @@ mod tests {
     #[test]
     fn create_writes_valid_header() {
         let handle = unique_handle("create-header");
-        let region = Region::create(&handle, 4, 1024, 60_000_000).expect("create");
+        let region = Region::create(&handle, 4, 1024, 60_000_000, false).expect("create");
         let h = region.read_header();
         assert_eq!(h.magic, MAGIC);
         assert_eq!(h.format_version, FORMAT_VERSION);
@@ -420,7 +425,7 @@ mod tests {
     #[test]
     fn create_initializes_slot_table_to_zero() {
         let handle = unique_handle("zero-slots");
-        let region = Region::create(&handle, 3, 256, 30_000_000).expect("create");
+        let region = Region::create(&handle, 3, 256, 30_000_000, false).expect("create");
         for i in 0..3 {
             let meta = region.read_slot_meta(i);
             assert_eq!(meta.lease_id_high, 0);
@@ -434,7 +439,7 @@ mod tests {
     #[test]
     fn attach_reads_creators_header() {
         let handle = unique_handle("attach-roundtrip");
-        let creator = Region::create(&handle, 2, 512, 45_000_000).expect("create");
+        let creator = Region::create(&handle, 2, 512, 45_000_000, false).expect("create");
         let attacher = Region::attach(&handle, 2, 512).expect("attach");
         assert!(!attacher.is_owner());
         assert_eq!(attacher.ttl_micros(), 45_000_000);
@@ -446,7 +451,7 @@ mod tests {
     #[test]
     fn attach_rejects_geometry_mismatch() {
         let handle = unique_handle("geometry-mismatch");
-        let _creator = Region::create(&handle, 4, 1024, 60_000_000).expect("create");
+        let _creator = Region::create(&handle, 4, 1024, 60_000_000, false).expect("create");
         let err = Region::attach(&handle, 8, 1024).unwrap_err();
         match err {
             TesseraPoolError::HeaderMismatch {
@@ -464,7 +469,7 @@ mod tests {
     #[test]
     fn attach_rejects_handle_mismatch() {
         let handle_a = unique_handle("handle-a");
-        let _creator = Region::create(&handle_a, 2, 256, 30_000_000).expect("create");
+        let _creator = Region::create(&handle_a, 2, 256, 30_000_000, false).expect("create");
         // Attach with a different description → different handle →
         // different POSIX SHM name → ShmemError::MapOpenFailed, NOT a
         // handle-digest mismatch. (Handle-digest mismatch is the
@@ -482,7 +487,7 @@ mod tests {
     #[test]
     fn write_then_read_slot_meta_roundtrips() {
         let handle = unique_handle("meta-roundtrip");
-        let mut region = Region::create(&handle, 2, 256, 30_000_000).expect("create");
+        let mut region = Region::create(&handle, 2, 256, 30_000_000, false).expect("create");
         let meta = SlotMeta {
             lease_id_high: 0x1122_3344_5566_7788,
             lease_id_low: 0x99AA_BBCC_DDEE_FF00,
@@ -506,7 +511,7 @@ mod tests {
     #[test]
     fn write_then_read_slot_payload_roundtrips() {
         let handle = unique_handle("payload-roundtrip");
-        let mut region = Region::create(&handle, 2, 64, 30_000_000).expect("create");
+        let mut region = Region::create(&handle, 2, 64, 30_000_000, false).expect("create");
         let payload: Vec<u8> = (0..32).collect();
         region.write_slot_payload(0, &payload);
         let read = region.read_slot_payload(0, 32).expect("read");
@@ -523,7 +528,7 @@ mod tests {
         // (not the creator's Region object). Validates that name
         // derivation alone is sufficient to coordinate.
         let handle = unique_handle("cross-attach");
-        let mut creator = Region::create(&handle, 4, 128, 60_000_000).expect("create");
+        let mut creator = Region::create(&handle, 4, 128, 60_000_000, false).expect("create");
         creator.write_slot_payload(2, b"hello attacher");
 
         let attacher = Region::attach(&handle, 4, 128).expect("attach");
