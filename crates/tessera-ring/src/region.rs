@@ -550,18 +550,25 @@ impl Region {
         self.check_slot_index(ordinal, slot_index)?;
         let offset = self.slot_offset(ordinal, slot_index) + Self::SEQUENCE_FIELD_OFFSET;
         // SAFETY: slot_offset(ordinal, slot_index) lies inside this
-        // section's data area (verified by check_slot_index). Alignment:
-        // sections_data_offset is 8-aligned; slot_stride includes the
-        // 64-byte SlotHeader so successive slots remain 8-aligned as
-        // long as slot_size_bytes is a multiple of 8 — for v0.1 we don't
-        // enforce that, but the sequence field is at slot offset 0 which
-        // inherits the slot's start alignment (and slot starts are
-        // header-relative: slot k starts at section_data + k * stride
-        // where stride includes SlotHeader::SIZE == 64; alignment is
-        // preserved). If a caller picks an odd slot_size_bytes we'd
-        // still be safe at sequence (offset 0) but timestamp_nanos /
-        // position would no longer be 8-aligned. v0.1 acceptable because
-        // we only use AtomicU64 on sequence.
+        // section's data area (verified by check_slot_index).
+        // Alignment guarantee chain:
+        //   * mmap base is page-aligned (4096), so the segment start
+        //     is way past 8-aligned.
+        //   * sections_data_offset = GlobalHeader::SIZE (128) +
+        //     section_count * SectionHeader::SIZE (64); both 128 and
+        //     64 are multiples of 8, so sections_data_offset is
+        //     8-aligned regardless of section_count.
+        //   * Per-section section_data_offsets are cumulative sums of
+        //     (slot_count * slot_stride). slot_stride = SlotHeader::SIZE
+        //     (64) + slot_size_bytes. validate_section_config enforces
+        //     slot_size_bytes % 8 == 0 (added as a Codex P1 fix on
+        //     PR #2 / commit 9577c0d), so every section's data offset
+        //     stays 8-aligned.
+        //   * Inside a section, slot k starts at section_data_offset +
+        //     k * stride; both are 8-aligned, so all slot starts are
+        //     8-aligned. The sequence field is at slot offset 0, so it
+        //     too is 8-aligned. AtomicU64 has the same layout as u64
+        //     (size 8, alignment 8); the cast is well-formed.
         unsafe {
             let ptr = self.shmem.as_ptr().add(offset) as *const AtomicU64;
             Ok(&*ptr)
@@ -719,6 +726,24 @@ fn validate_section_config(sections: &[SectionConfig]) -> Result<()> {
                 cfg.section_id()
             )));
         }
+        // slot_size_bytes must be a multiple of 8 so that successive
+        // slot starts remain 8-byte-aligned (slot_stride = 64 + size).
+        // The Region layer takes `&AtomicU64` references into the
+        // mapped bytes at slot.sequence offsets — misaligned references
+        // are UB on strict-alignment targets and can fault on x86.
+        // (Codex P1 on PR #2: enforce here rather than at the
+        // unsafe cast site so the failure mode is fail-at-construction,
+        // not fail-at-first-fetch-add.)
+        if cfg.slot_size_bytes() % 8 != 0 {
+            return Err(TesseraRingError::Config(format!(
+                "section {} has slot_size_bytes={} which is not a multiple of 8; \
+                slot stride must be 8-byte-aligned for AtomicU64 access on slot.sequence \
+                (round up to {})",
+                cfg.section_id(),
+                cfg.slot_size_bytes(),
+                (cfg.slot_size_bytes() + 7) & !7,
+            )));
+        }
         if seen.insert(cfg.section_id(), ()).is_some() {
             return Err(TesseraRingError::Config(format!(
                 "duplicate section_id {} in config list",
@@ -867,6 +892,35 @@ mod tests {
         match err {
             TesseraRingError::Config(msg) => assert!(msg.contains("slot_size_bytes == 0")),
             other => panic!("expected Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slot_size_not_multiple_of_8_is_rejected() {
+        // Codex P1 fix: slot_size_bytes must be a multiple of 8 so
+        // successive slot starts (and therefore slot.sequence offsets)
+        // stay 8-byte-aligned for the AtomicU64 cast in
+        // slot_sequence_atomic. Test the rejection path.
+        for bad_size in [1u32, 7, 17, 100, 1023, 2049] {
+            let handle = unique_handle(&format!("misalign-{bad_size}"));
+            let sections = vec![SectionConfig::new(0, 4, bad_size)];
+            let err = Region::create(&handle, &sections, false).unwrap_err();
+            match err {
+                TesseraRingError::Config(msg) => {
+                    assert!(
+                        msg.contains("not a multiple of 8"),
+                        "expected alignment error for size {bad_size}, got: {msg}"
+                    );
+                }
+                other => panic!("expected Config error for size {bad_size}, got {other:?}"),
+            }
+        }
+        // And conversely, multiples of 8 pass: 8, 16, 64, 1024, 2048.
+        for good_size in [8u32, 16, 64, 1024, 2048] {
+            let handle = unique_handle(&format!("aligned-{good_size}"));
+            let sections = vec![SectionConfig::new(0, 4, good_size)];
+            let _ok = Region::create(&handle, &sections, false)
+                .unwrap_or_else(|e| panic!("expected ok for size {good_size}, got {e:?}"));
         }
     }
 

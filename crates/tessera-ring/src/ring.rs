@@ -184,19 +184,48 @@ impl Writer {
             .fetch_add(1, Ordering::AcqRel);
         let slot_index = (position % slot_count as u64) as u32;
 
-        // 2. Bump slot.sequence to odd (write in progress). We load,
-        //    add 1, and store with Release so the upcoming non-atomic
-        //    writes are visible to readers after the matching
-        //    Acquire-load of the post-write sequence.
+        // 2. Acquire seqlock-odd state on this slot via CAS so only
+        //    one writer can write to a given slot at a time. Under
+        //    high-throughput wraparound (or tight slot_count), two
+        //    writers fetch_add unique positions but can map to the same
+        //    slot_index; an unconditional load+store would let both
+        //    enter the "writing" state simultaneously, breaking the
+        //    seqlock invariant (Codex P1 on this PR's `9577c0d`).
+        //
+        //    Protocol: load sequence, require it to be even (i.e. no
+        //    other writer in progress), then CAS to (seq_before + 1)
+        //    (odd). On CAS failure or odd-observed, spin and retry.
+        //    This serializes writers per-slot but does NOT block writers
+        //    targeting different slots — concurrency stays high as long
+        //    as the writer load is spread across many slots.
         let seq_atomic = self.region.slot_sequence_atomic(ordinal, slot_index)?;
-        let seq_before = seq_atomic.load(Ordering::Acquire);
-        // We unconditionally bump to (seq_before | 1) + 0 OR
-        // seq_before + 1; both produce an odd value when seq_before
-        // was even. The seqlock guarantee is "sequence is odd during
-        // write, then we add another 1 to make it even (and one
-        // higher than before)". Standard pattern:
-        let seq_writing = seq_before.wrapping_add(1);
-        seq_atomic.store(seq_writing, Ordering::Release);
+        let seq_writing = loop {
+            let seq_before = seq_atomic.load(Ordering::Acquire);
+            if seq_before & 1 == 1 {
+                // Another writer holds odd state on this slot. Spin
+                // and retry. Tight rings (slot_count == 1, sustained
+                // contention) will see this most often; the lossy
+                // contract still holds because writers don't BLOCK on
+                // readers, they only serialize among themselves on the
+                // same slot.
+                core::hint::spin_loop();
+                continue;
+            }
+            let candidate = seq_before.wrapping_add(1);
+            match seq_atomic.compare_exchange_weak(
+                seq_before,
+                candidate,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break candidate,
+                Err(_) => {
+                    // Another writer beat us. Retry.
+                    core::hint::spin_loop();
+                    continue;
+                }
+            }
+        };
 
         // 3. Write the slot header fields + payload inside the odd
         //    window. SAFETY: we hold the seqlock-odd state on this
@@ -713,5 +742,125 @@ mod tests {
         // If naming weren't BLAKE3-stable, this assert would fire.
         let same_handle = NamespaceHandle::derive(&desc);
         assert_eq!(handle.full_digest(), same_handle.full_digest());
+    }
+
+    #[test]
+    fn concurrent_writers_serialize_on_same_slot_without_torn_reads() {
+        // Codex P1 fix verification: under high-throughput multi-writer
+        // contention on a tight ring, writers must CAS-acquire the
+        // seqlock-odd state rather than unconditionally store, or two
+        // writers wrapping to the same slot can break the seqlock
+        // invariant and let readers observe torn payloads.
+        //
+        // Setup: 4 writer threads, each opening its own attacher Ring
+        // handle (Ring is !Send so we can't share one Arc), publishing
+        // N events of 16 bytes each (encoding writer_id + sequence) to
+        // a tight ring (slot_count = 1) that forces every publish to
+        // contend on slot 0. The main thread drains as reader. Each
+        // delivered event is range-checked — a torn read would mix the
+        // high half of one writer's payload with the low half of
+        // another's, and almost surely fail one of the bounds.
+        use std::thread;
+
+        const N_WRITERS: u64 = 4;
+        const N_EVENTS_PER_WRITER: u64 = 1000;
+
+        let description = unique_description("concurrent-writers");
+        let sections = vec![SectionConfig::new(0, 1, 16)];
+
+        // Owner Ring lives on the main thread; holds SHM lifetime.
+        let owner_ring = Ring::open(RingConfig {
+            description: description.clone(),
+            sections: sections.clone(),
+            is_owner: true,
+            force_recreate: false,
+        })
+        .expect("owner open");
+        let mut reader = owner_ring.reader(0).expect("reader");
+
+        // Spawn writer threads. Each opens its OWN attacher Ring
+        // (description is the only thing crossing the thread boundary;
+        // String is Send).
+        let writer_threads: Vec<_> = (0..N_WRITERS)
+            .map(|writer_id| {
+                let desc = description.clone();
+                let sections = sections.clone();
+                thread::spawn(move || {
+                    let attacher = Ring::open(RingConfig {
+                        description: desc,
+                        sections,
+                        is_owner: false,
+                        force_recreate: false,
+                    })
+                    .expect("attacher open");
+                    let w = attacher.writer();
+                    for seq in 0..N_EVENTS_PER_WRITER {
+                        let mut payload = [0u8; 16];
+                        payload[..8].copy_from_slice(&writer_id.to_le_bytes());
+                        payload[8..].copy_from_slice(&seq.to_le_bytes());
+                        w.publish(0, &payload).expect("publish");
+                    }
+                })
+            })
+            .collect();
+
+        // Reader drain loop: keep polling until all writers have
+        // finished AND we've seen no new events.
+        let mut total_delivered = 0u64;
+        let total_published = N_WRITERS * N_EVENTS_PER_WRITER;
+        let mut writers_done = false;
+        let mut writer_handles = Some(writer_threads);
+        loop {
+            // Try joining writers without blocking the reader thread
+            // forever. Simple approach: once latest >= total_published,
+            // join + final drain.
+            let events = reader.poll().expect("poll");
+            for e in &events {
+                assert_eq!(e.payload.len(), 16, "payload length must be 16");
+                let writer_id = u64::from_le_bytes(e.payload[..8].try_into().unwrap());
+                let seq = u64::from_le_bytes(e.payload[8..].try_into().unwrap());
+                assert!(
+                    writer_id < N_WRITERS,
+                    "writer_id {writer_id} out of range — torn read?"
+                );
+                assert!(
+                    seq < N_EVENTS_PER_WRITER,
+                    "seq {seq} out of range for writer {writer_id} — torn read?"
+                );
+            }
+            total_delivered += events.len() as u64;
+
+            if !writers_done {
+                let stats = reader.stats().expect("stats");
+                if stats.latest >= total_published {
+                    // All writers finished publishing. Join them, then
+                    // continue draining whatever remains.
+                    for h in writer_handles.take().unwrap() {
+                        h.join().expect("writer join");
+                    }
+                    writers_done = true;
+                }
+            } else if events.is_empty() {
+                // Writers done + we got nothing new this poll → drain
+                // complete.
+                break;
+            }
+
+            if events.is_empty() {
+                std::thread::yield_now();
+            }
+        }
+
+        // Accounting consistency check. The 1-slot ring is brutally
+        // lossy by design, so most events are dropped — that's
+        // expected. We just need delivered + dropped == published, and
+        // zero torn reads (asserted inline above).
+        let total_dropped = reader.dropped();
+        assert_eq!(
+            total_delivered + total_dropped,
+            total_published,
+            "delivered ({total_delivered}) + dropped ({total_dropped}) \
+            should equal published ({total_published})"
+        );
     }
 }
