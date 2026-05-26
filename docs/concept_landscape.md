@@ -32,9 +32,9 @@ mental model that frames where each spec'd piece sits.
 | Concept | Layer | Contract (one-line) | Use case | Built on | Status |
 |---|---|---|---|---|---|
 | **Pool** | Primitive | Non-lossy, lease/return, large opaque payloads, single-writer-per-slot, point-to-point handoff via descriptor | Hand off 64 MB training batch / parquet chunk / model snapshot between owner and worker | raw SHM | Shipped (v0.0.1) |
-| **Ring** | Primitive | Lossy, multi-writer, multi-reader broadcast, small-to-medium payloads, fire-and-forget, FIFO per section | Telemetry / metrics / log fan-out to multiple independent consumers (TUI + Prometheus + archiver) | raw SHM | In flight (PR #2) |
-| **Channel** | Primitive | Non-lossy, multi-producer / single-consumer, small typed messages, FIFO, blocking-or-fail-fast backpressure | Reliable queue: control plane, ack plane, RPC messages, anything where dropping is not OK | raw SHM | Proposed for Stage 4c |
-| **Sink** | Service | Atomic-write-to-disk worker pool with chunking + hash integrity + optional fsync | Persist large artifacts (batches, snapshots, logs) durably from a hot-path producer without blocking it | Pool (payload) + Channel (control + ack) | Scaffold only; real impl as Stage 4d |
+| **Ring** | Primitive | Lossy, multi-writer, multi-reader broadcast, small-to-medium payloads, fire-and-forget, FIFO per section | Telemetry / metrics / log fan-out to multiple independent consumers (TUI + Prometheus + archiver) | raw SHM | Shipped (v0.0.1) |
+| **Channel** | Primitive | Non-lossy, multi-producer / single-consumer, small typed messages, FIFO, blocking-or-fail-fast backpressure | Reliable queue: control plane, ack plane, RPC messages, anything where dropping is not OK | raw SHM | Shipped (v0.0.1) |
+| **Sink** | Service | Atomic-write-to-disk worker pool with chunking + hash integrity + optional fsync | Persist large artifacts (batches, snapshots, logs) durably from a hot-path producer without blocking it | Pool (payload) + Channel (control + ack) | In flight (PR #10) |
 
 ### Tid-bits on each
 
