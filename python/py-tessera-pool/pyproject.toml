@@ -23,6 +23,9 @@ classifiers = [
 [project.urls]
 Repository = "https://github.com/Indubitable-Industries/tessera"
 
+[project.optional-dependencies]
+test = ["pytest>=7", "syrupy>=4"]
+
 [tool.maturin]
 module-name = "tessera_pool._native"
 python-source = "python"

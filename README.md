@@ -13,6 +13,47 @@ region via shared IPC namespaces.
 
 ---
 
+## Why another shared-memory library?
+
+Several libraries already cover parts of this space well:
+
+- **Python stdlib [`multiprocessing.shared_memory`](https://docs.python.org/3/library/multiprocessing.shared_memory.html)** —
+  a raw named byte buffer. No slot management, no lifecycle, no lease
+  coordination; you build those yourself.
+- **[`posix_ipc`](https://pypi.org/project/posix_ipc/), [`sysv_ipc`](https://pypi.org/project/sysv_ipc/)** —
+  thin wrappers around the POSIX / SysV syscalls. Building blocks, not
+  policy.
+- **[iceoryx](https://iceoryx.io/) / [iceoryx2](https://github.com/eclipse-iceoryx/iceoryx2)** —
+  lock-free zero-copy pub/sub aimed at HPC and robotics. Large, capable
+  API surface; C++-first with Rust bindings.
+- **Apache Arrow Plasma** — deprecated.
+- **Aeron, ZeroMQ inproc, nng** — message-transport-oriented; a
+  different model than slot-and-descriptor handoff.
+
+Tessera is shaped differently in three ways:
+
+1. **Three opinionated primitives, not a general framework.** Pool
+   (transactional bytes), Ring (lossy event broadcast), Sink (atomic
+   I/O over Pool). Each does one thing. They share design language —
+   BLAKE3-derived region handles, descriptor handoff, owner-held leases
+   — so composing them stays predictable.
+2. **Extracted from a running ML system,** not designed in the
+   abstract. The lifecycle decisions (single-owner regions, lease
+   renewal under slow consumers, gap detection for late-attaching
+   readers, refuse-to-clobber semantics on create) are answers to
+   incidents that actually happened.
+3. **Rust core, thin PyO3 facade.** Production code paths live in
+   Rust; Python is the front-of-house. Type and lifetime safety come
+   from the host language, not from contract docs.
+
+We open-sourced it because the extracted shape was small, self-contained,
+and seemed generally useful for anyone moving large payloads between
+Python processes — train/eval loops, inference pipelines, telemetry
+drainers, artifact stagers. If your problem is "I want to hand 100 MB of
+bytes to a worker without re-pickling," this might fit. If you want
+something more battle-tested for production today, iceoryx2 and Aeron
+are excellent.
+
 ## Why
 
 Most Python multiprocessing primitives optimize for small messages and

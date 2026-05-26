@@ -1,0 +1,30 @@
+{
+  "in_use_after_release": 0,
+  "in_use_after_writes": 4,
+  "payloads": [
+    {
+      "content_sha256": "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",
+      "name": "alpha_1B",
+      "size": 1
+    },
+    {
+      "content_sha256": "41203397c5270fedec2d02b1a329a41c385b056f8976211eb57f1f36da6a561d",
+      "name": "bravo_256B",
+      "size": 256
+    },
+    {
+      "content_sha256": "50eae2673c968596773780b7e88ec67196a0dfb3c140a0ba320ce0dd4e05d608",
+      "name": "charlie_4KiB",
+      "size": 4096
+    },
+    {
+      "content_sha256": "43a123b84c13e0b3a483b1af4fe4d99099445baa482557f45918ac2d7868c5e6",
+      "name": "delta_16KiB",
+      "size": 16384
+    }
+  ],
+  "pool_config": {
+    "slot_count": 4,
+    "slot_size_bytes": 16384
+  }
+}
