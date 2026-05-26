@@ -50,7 +50,13 @@ fn map_err(e: RustSinkError) -> PyErr {
 /// sibling of the current executable, then `PATH`.
 #[pyclass(name = "Sink", module = "tessera_sink", unsendable)]
 struct PySink {
-    inner: Mutex<Option<RustSink>>,
+    // Boxed: `Sink` transitively embeds a `crossbeam_queue::SegQueue`
+    // whose `CachePadded` is `#[repr(align(128))]`. Python's object
+    // allocator only guarantees ~16-byte alignment for the pyclass
+    // storage, so holding a `Sink` inline would be UB (misaligned).
+    // The `Box` keeps only a pointer inline; the heap allocation honors
+    // the 128-byte alignment.
+    inner: Mutex<Option<Box<RustSink>>>,
     worker_count: u32,
     description: String,
 }
@@ -64,7 +70,7 @@ impl PySink {
         let sink = guard
             .as_mut()
             .ok_or_else(|| TesseraSinkError::new_err("Sink is closed"))?;
-        op(sink).map_err(map_err)
+        op(&mut **sink).map_err(map_err)
     }
 }
 
@@ -133,7 +139,7 @@ impl PySink {
         };
         let sink = RustSink::start(config).map_err(map_err)?;
         Ok(Self {
-            inner: Mutex::new(Some(sink)),
+            inner: Mutex::new(Some(Box::new(sink))),
             worker_count,
             description,
         })
