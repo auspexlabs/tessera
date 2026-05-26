@@ -49,6 +49,7 @@
 
 pub mod config;
 pub mod error;
+pub mod messages;
 pub mod names;
 
 // Re-export the underlying primitives so a consumer can pull the
