@@ -30,6 +30,13 @@ pub struct Region {
     /// commit 0e39176.
     shm_name: String,
     is_owner: bool,
+    /// True once `Region::unlink()` has been called successfully.
+    /// Used to short-circuit subsequent `unlink()` calls so a stale
+    /// owner can't race a successor's freshly-created region with
+    /// the same name (Codex PR #4 iter-3 P1 — comment 3304957184).
+    /// Without this flag, A's second unlink() call after B has
+    /// recreated the same name would remove B's name.
+    manually_unlinked: bool,
 }
 
 impl core::fmt::Debug for Region {
@@ -126,6 +133,7 @@ impl Region {
             slot_size_bytes,
             shm_name: name,
             is_owner: true,
+            manually_unlinked: false,
         };
         region.write_header(handle, epoch_micros, slot_count, slot_size_bytes, ttl_micros);
         // Slot table starts zeroed (Shmem create zeroes the mapping on
@@ -158,6 +166,7 @@ impl Region {
             slot_size_bytes: expected_slot_size_bytes,
             shm_name: name,
             is_owner: false,
+            manually_unlinked: false,
         };
         region.validate_attached_header(handle, expected_slot_count, expected_slot_size_bytes)?;
         Ok(region)
@@ -411,6 +420,17 @@ impl Region {
     /// the name out from under the creating owner. Returns a `Region`
     /// error in that case to enforce the lifecycle contract.
     pub fn unlink(&mut self) -> Result<()> {
+        // Idempotent short-circuit: once we've already unlinked, do
+        // nothing further. This is the Codex iter-3 fix (PR #4
+        // comment 3304957184) — without this short-circuit, a stale
+        // owner A who calls unlink() a SECOND time after a successor
+        // B has recreated the name would call libc::shm_unlink again
+        // and remove B's freshly-created name. The first unlink
+        // already released our claim on the OS name; we must not
+        // touch it again.
+        if self.manually_unlinked {
+            return Ok(());
+        }
         if !self.is_owner {
             return Err(TesseraPoolError::Region(
                 "Region::unlink called by an attacher (is_owner=false). Only the \
@@ -430,22 +450,24 @@ impl Region {
             })?;
             // SAFETY: cname is a valid NUL-terminated C string;
             // shm_unlink is thread-safe POSIX. Return value is
-            // ignored because this is best-effort idempotent cleanup
-            // (ENOENT is normal on the second call).
+            // ignored because this is best-effort cleanup (ENOENT
+            // on a missing name is normal — though with the
+            // manually_unlinked short-circuit above we should never
+            // reach here twice for the same Region).
             unsafe {
                 libc::shm_unlink(cname.as_ptr());
             }
         }
-        // Codex P1 on PR #4 (comment 3304769711): suppress the
-        // Shmem's drop-time unlink. Without this, a handoff/restart
-        // sequence (owner A unlinks, owner B creates a fresh region
-        // with the same name, then A finally drops) would have A's
-        // drop call shm_unlink AGAIN, racily removing B's freshly
-        // created name and causing B's attachers/peers to fail.
-        // After explicit unlink we've already released name-ownership;
-        // the Shmem's mapping remains valid for this Region's lifetime
-        // but its drop must not re-touch the OS name.
+        // Codex P1 on PR #4 iter-1 (comment 3304769711): suppress
+        // the Shmem's drop-time unlink. Without this, a
+        // handoff/restart sequence (owner A unlinks, owner B creates
+        // a fresh region with the same name, then A finally drops)
+        // would have A's drop call shm_unlink AGAIN, racily removing
+        // B's freshly created name.
         self.shmem.set_owner(false);
+        // Block any future unlink() call from this Region (Codex
+        // iter-3 fix). Subsequent calls hit the early-return above.
+        self.manually_unlinked = true;
         Ok(())
     }
 }
@@ -691,6 +713,48 @@ mod tests {
         assert_eq!(attacher.slot_count(), 4);
         assert_eq!(attacher.slot_size_bytes(), 128);
         drop(attacher);
+        drop(owner_b);
+    }
+
+    #[test]
+    fn stale_owners_second_unlink_does_not_clobber_successor() {
+        // Codex iter-3 P1 on PR #4 (comment 3304957184): the
+        // drop-time unlink fix in iter-1 wasn't enough — a stale
+        // owner A who explicitly calls unlink() a SECOND time after
+        // successor B has recreated the same name would still call
+        // libc::shm_unlink and remove B's name.
+        //
+        // Sequence under test:
+        //   1. A creates region X (name N).
+        //   2. A calls A.unlink() — name N removed; A's drop suppressed.
+        //   3. B creates a fresh region with name N (succeeds — name
+        //      was cleared in step 2).
+        //   4. A calls A.unlink() AGAIN (stale call from a process
+        //      that doesn't realize B has taken over).
+        //   5. Verify B's name still resolves — A's second unlink
+        //      MUST be a no-op, not a stray libc::shm_unlink.
+        let handle = unique_handle("stale-double-unlink");
+        let mut owner_a = Region::create(&handle, 2, 64, 60_000_000, false).expect("A create");
+        owner_a.unlink().expect("A first unlink");
+
+        // B creates fresh region with the same name.
+        let owner_b =
+            Region::create(&handle, 4, 128, 60_000_000, false).expect("B create after A unlink");
+
+        // A's STALE second unlink must not touch B's name.
+        owner_a.unlink().expect("A second unlink should be a no-op");
+
+        // B's name must still resolve.
+        let attacher = Region::attach(&handle, 4, 128).expect("attach B after A's stale 2nd unlink");
+        assert_eq!(attacher.slot_count(), 4);
+        assert_eq!(attacher.slot_size_bytes(), 128);
+        drop(attacher);
+
+        // Drop A — also must not touch the OS name (covered by the
+        // sibling handoff-safety test, repeated here for thoroughness).
+        drop(owner_a);
+        let attacher2 = Region::attach(&handle, 4, 128).expect("attach B after A's drop");
+        drop(attacher2);
         drop(owner_b);
     }
 
