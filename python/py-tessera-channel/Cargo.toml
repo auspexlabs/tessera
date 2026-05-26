@@ -13,5 +13,6 @@ name = "tessera_channel"
 crate-type = ["cdylib"]
 
 [dependencies]
+parking_lot = "0.12"
 pyo3 = { workspace = true }
 tessera-channel = { workspace = true }
