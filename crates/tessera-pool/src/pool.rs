@@ -57,11 +57,6 @@ struct OwnerState {
     /// Lock-free queue of currently-free slot indices. Acquire pops;
     /// release / reclaim_stale push.
     free_slots: SegQueue<u32>,
-    /// Coarse-grained mutex around the slot-table mutation path.
-    /// Acquired by acquire / release / write / renew / reclaim_stale
-    /// before reading-validating-writing a SlotMeta in SHM. Held only
-    /// for the duration of one mutation — no I/O under the lock.
-    slot_mutation_lock: Mutex<()>,
 }
 
 /// Non-lossy lease-backed shared-memory pool.
@@ -70,14 +65,45 @@ struct OwnerState {
 /// `is_owner: true`); zero or more attachers may construct with
 /// `is_owner: false` and consume payload bytes via descriptors handed
 /// across IPC.
+///
+/// All `&self` methods are safe to call concurrently from multiple
+/// threads (the type is `Send + Sync`, see the `unsafe impl`s below).
+/// Per-slot mutual exclusion comes from `slot_locks`; the free-list is a
+/// lock-free `SegQueue`. No lock is ever held across a blocking wait, so
+/// e.g. a thread blocked in `acquire` never prevents another thread's
+/// `release` from making progress (Constraint 2 of the thread-safety
+/// design doc).
 #[derive(Debug)]
 pub struct Pool {
     region: Region,
     owner_state: Option<OwnerState>,
+    /// One mutex per slot, guarding the read-validate-write of that
+    /// slot's `SlotMeta` + payload against concurrent *in-process*
+    /// access. `slot_locks[i]` is taken (briefly, never across a wait)
+    /// by acquire / write / release / renew / reclaim_stale and by the
+    /// read path (`read_payload`, `in_use_count`). Present on both owner
+    /// and attacher Pools; cross-*process* races are handled by the SHM
+    /// generation protocol, not these locks.
+    slot_locks: Box<[Mutex<()>]>,
     /// Cached TTL — for owners, copied from PoolConfig; for attachers,
     /// inherited from the SHM header.
     ttl_micros: u64,
 }
+
+// SAFETY: `Region` wraps a `shared_memory::Shmem` whose raw pointer makes
+// `Pool` `!Send + !Sync` by default. The pointer addresses a
+// process-global mmap, valid from any thread of this process. Every
+// in-process access to slot metadata / payload bytes is serialized by
+// `slot_locks[slot_index]` (mutations and the validate-then-copy read
+// path alike); the free-list is a lock-free `SegQueue`; the header is
+// immutable after construction. Cross-process access is serialized by
+// the SHM generation/lease protocol (a reclaim bumps the generation, so
+// a stale descriptor fails validation before reading torn bytes). Drop
+// (`munmap` / `shm_unlink`) is a thread-agnostic syscall. Therefore
+// moving a `Pool` between threads and sharing `&Pool` across threads are
+// both sound.
+unsafe impl Send for Pool {}
+unsafe impl Sync for Pool {}
 
 impl Pool {
     /// Construct a Pool. Owner path creates and initializes the SHM
@@ -99,6 +125,14 @@ impl Pool {
 
         let handle = NamespaceHandle::derive(&config.description);
 
+        // One mutex per slot, on both owner and attacher Pools. The
+        // attacher's geometry is validated to match the owner's in
+        // `Region::attach`, so `slot_count` indexes both consistently.
+        let slot_locks: Box<[Mutex<()>]> = (0..config.slot_count)
+            .map(|_| Mutex::new(()))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+
         if config.is_owner {
             if config.ttl_micros == 0 {
                 return Err(TesseraPoolError::Config(
@@ -119,10 +153,8 @@ impl Pool {
             }
             Ok(Self {
                 region,
-                owner_state: Some(OwnerState {
-                    free_slots,
-                    slot_mutation_lock: Mutex::new(()),
-                }),
+                owner_state: Some(OwnerState { free_slots }),
+                slot_locks,
                 ttl_micros: config.ttl_micros,
             })
         } else {
@@ -131,6 +163,7 @@ impl Pool {
             Ok(Self {
                 region,
                 owner_state: None,
+                slot_locks,
                 ttl_micros,
             })
         }
@@ -161,7 +194,7 @@ impl Pool {
     ///
     /// On success, the slot is marked IN_USE with a fresh 128-bit
     /// lease_id and a bumped generation counter.
-    pub fn acquire(&mut self, timeout: Duration) -> Result<Lease> {
+    pub fn acquire(&self, timeout: Duration) -> Result<Lease> {
         let state = self
             .owner_state
             .as_ref()
@@ -170,6 +203,8 @@ impl Pool {
 
         // Poll the queue. SegQueue::pop is non-blocking; we sleep
         // briefly between attempts so a busy spin doesn't peg a core.
+        // No lock is held across this wait, so a concurrent `release`
+        // can return a slot to the queue and unblock us (Constraint 2).
         let slot_index = loop {
             if let Some(idx) = state.free_slots.pop() {
                 break idx;
@@ -182,10 +217,11 @@ impl Pool {
             std::thread::sleep(Duration::from_millis(5));
         };
 
-        // Mutate the slot meta under the slot-mutation lock so a
-        // concurrent owner-side reclaim sweep doesn't race the
-        // generation bump.
-        let _guard = state.slot_mutation_lock.lock();
+        // The slot is ours (popped from the free list, so no other
+        // acquire holds it). Take its per-slot lock to mutate the meta
+        // without racing an in-process reader / reclaim sweep of the
+        // same slot.
+        let _guard = self.slot_locks[slot_index as usize].lock();
         let mut meta = self.region.read_slot_meta(slot_index)?;
         let lease_id = LeaseId::from_bytes(fresh_lease_id_bytes());
         meta.generation = meta.generation.wrapping_add(1);
@@ -204,11 +240,10 @@ impl Pool {
     ///
     /// v0.1 is one-shot: a second `write` on the same lease
     /// fails with `WriteAfterFinalize`.
-    pub fn write(&mut self, lease: &Lease, payload: &[u8]) -> Result<Descriptor> {
-        let state = self
-            .owner_state
-            .as_ref()
-            .ok_or(TesseraPoolError::OwnerOnly)?;
+    pub fn write(&self, lease: &Lease, payload: &[u8]) -> Result<Descriptor> {
+        if self.owner_state.is_none() {
+            return Err(TesseraPoolError::OwnerOnly);
+        }
         if payload.len() > self.region.slot_size_bytes() as usize {
             return Err(TesseraPoolError::OversizedPayload {
                 payload_size: payload.len(),
@@ -216,7 +251,7 @@ impl Pool {
             });
         }
 
-        let _guard = state.slot_mutation_lock.lock();
+        let _guard = self.slot_locks[lease.slot_index() as usize].lock();
         let mut meta = self.region.read_slot_meta(lease.slot_index())?;
         validate_lease(lease, &meta)?;
         if meta.payload_finalized() {
@@ -262,6 +297,12 @@ impl Pool {
                 self.region.slot_count()
             )));
         }
+        // Hold the per-slot lock across validate-then-copy so a
+        // concurrent in-process write / release / reclaim of this slot
+        // can't tear the read. (Cross-process tearing is prevented by
+        // the generation check in validate_descriptor + the owner
+        // protocol of holding the lease until the reader acks.)
+        let _guard = self.slot_locks[slot_index as usize].lock();
         let meta = self.region.read_slot_meta(slot_index)?;
         validate_descriptor(descriptor, &meta)?;
         // Descriptor size must match what was actually written. A
@@ -291,12 +332,12 @@ impl Pool {
 
     /// Release a leased slot (owner-only). The slot's metadata is
     /// cleared and the slot index is returned to the free list.
-    pub fn release(&mut self, lease: &Lease) -> Result<()> {
+    pub fn release(&self, lease: &Lease) -> Result<()> {
         let state = self
             .owner_state
             .as_ref()
             .ok_or(TesseraPoolError::OwnerOnly)?;
-        let _guard = state.slot_mutation_lock.lock();
+        let _guard = self.slot_locks[lease.slot_index() as usize].lock();
         let meta = self.region.read_slot_meta(lease.slot_index())?;
         validate_lease(lease, &meta)?;
         // Clear meta — but DO NOT bump generation on a normal release.
@@ -317,12 +358,11 @@ impl Pool {
 
     /// Renew a lease's `acquired_at` so the next reclaim sweep doesn't
     /// reclaim it. Owner-side only — workers cannot renew via descriptor.
-    pub fn renew(&mut self, lease: &Lease) -> Result<()> {
-        let state = self
-            .owner_state
-            .as_ref()
-            .ok_or(TesseraPoolError::OwnerOnly)?;
-        let _guard = state.slot_mutation_lock.lock();
+    pub fn renew(&self, lease: &Lease) -> Result<()> {
+        if self.owner_state.is_none() {
+            return Err(TesseraPoolError::OwnerOnly);
+        }
+        let _guard = self.slot_locks[lease.slot_index() as usize].lock();
         let mut meta = self.region.read_slot_meta(lease.slot_index())?;
         validate_lease(lease, &meta)?;
         meta.acquired_at_micros = monotonic_micros();
@@ -336,16 +376,18 @@ impl Pool {
     /// Generation is bumped on each reclaimed slot, so any in-flight
     /// descriptor against that slot will fail `validate_descriptor`
     /// before it can read stale bytes.
-    pub fn reclaim_stale(&mut self) -> Result<u32> {
+    pub fn reclaim_stale(&self) -> Result<u32> {
         let state = self
             .owner_state
             .as_ref()
             .ok_or(TesseraPoolError::OwnerOnly)?;
         let now = monotonic_micros();
         let ttl = self.ttl_micros;
-        let _guard = state.slot_mutation_lock.lock();
         let mut reclaimed = 0_u32;
         for i in 0..self.region.slot_count() {
+            // Per-slot lock, taken and released per iteration — never
+            // all slots at once, and never across a wait.
+            let _guard = self.slot_locks[i as usize].lock();
             let meta = self.region.read_slot_meta(i)?;
             if !meta.in_use() {
                 continue;
@@ -377,6 +419,9 @@ impl Pool {
     pub fn in_use_count(&self) -> Result<u32> {
         let mut n = 0;
         for i in 0..self.region.slot_count() {
+            // Per-slot lock per read so the meta isn't torn by a
+            // concurrent acquire / release / reclaim of that slot.
+            let _guard = self.slot_locks[i as usize].lock();
             if self.region.read_slot_meta(i)?.in_use() {
                 n += 1;
             }
@@ -473,7 +518,7 @@ mod tests {
 
     #[test]
     fn owner_can_acquire_and_release() {
-        let mut pool = Pool::new(owner_config("acquire-release", 4, 256)).expect("new");
+        let pool = Pool::new(owner_config("acquire-release", 4, 256)).expect("new");
         assert_eq!(pool.in_use_count().expect("in_use"), 0);
 
         let lease1 = pool.acquire(Duration::from_secs(1)).expect("acquire 1");
@@ -490,7 +535,7 @@ mod tests {
 
     #[test]
     fn acquire_exhausts_then_times_out() {
-        let mut pool = Pool::new(owner_config("exhaust", 2, 128)).expect("new");
+        let pool = Pool::new(owner_config("exhaust", 2, 128)).expect("new");
         let _l1 = pool.acquire(Duration::from_secs(1)).expect("l1");
         let _l2 = pool.acquire(Duration::from_secs(1)).expect("l2");
         let err = pool.acquire(Duration::from_millis(50)).unwrap_err();
@@ -502,7 +547,7 @@ mod tests {
 
     #[test]
     fn release_returns_slot_to_free_list() {
-        let mut pool = Pool::new(owner_config("release-returns", 1, 64)).expect("new");
+        let pool = Pool::new(owner_config("release-returns", 1, 64)).expect("new");
         let lease_a = pool.acquire(Duration::from_secs(1)).expect("a");
         // Second acquire would time out since only one slot exists.
         assert!(pool.acquire(Duration::from_millis(20)).is_err());
@@ -517,7 +562,7 @@ mod tests {
 
     #[test]
     fn write_then_read_payload_via_descriptor() {
-        let mut pool = Pool::new(owner_config("write-read", 2, 1024)).expect("new");
+        let pool = Pool::new(owner_config("write-read", 2, 1024)).expect("new");
         let lease = pool.acquire(Duration::from_secs(1)).expect("acquire");
         let payload = b"hello tessera pool";
         let descriptor = pool.write(&lease, payload).expect("write");
@@ -531,7 +576,7 @@ mod tests {
 
     #[test]
     fn write_rejects_oversized_payload() {
-        let mut pool = Pool::new(owner_config("oversized", 1, 16)).expect("new");
+        let pool = Pool::new(owner_config("oversized", 1, 16)).expect("new");
         let lease = pool.acquire(Duration::from_secs(1)).expect("acquire");
         let big_payload = vec![0u8; 32];
         let err = pool.write(&lease, &big_payload).unwrap_err();
@@ -549,7 +594,7 @@ mod tests {
 
     #[test]
     fn double_write_on_same_lease_is_rejected() {
-        let mut pool = Pool::new(owner_config("double-write", 1, 64)).expect("new");
+        let pool = Pool::new(owner_config("double-write", 1, 64)).expect("new");
         let lease = pool.acquire(Duration::from_secs(1)).expect("acquire");
         pool.write(&lease, b"first").expect("first write");
         let err = pool.write(&lease, b"second").unwrap_err();
@@ -564,7 +609,7 @@ mod tests {
         // Short TTL so reclaim_stale fires.
         let mut config = owner_config("reclaim-stale", 1, 64);
         config.ttl_micros = 1; // 1 microsecond — effectively "anything held is stale"
-        let mut pool = Pool::new(config).expect("new");
+        let pool = Pool::new(config).expect("new");
         let lease = pool.acquire(Duration::from_secs(1)).expect("acquire");
         let descriptor = pool.write(&lease, b"abc").expect("write");
 
@@ -594,7 +639,7 @@ mod tests {
     fn renew_keeps_lease_alive_through_reclaim_sweep() {
         let mut config = owner_config("renew", 1, 64);
         config.ttl_micros = 50_000; // 50 ms
-        let mut pool = Pool::new(config).expect("new");
+        let pool = Pool::new(config).expect("new");
         let lease = pool.acquire(Duration::from_secs(1)).expect("acquire");
 
         // Wait past 1/2 the TTL, renew, wait again — total > TTL but
@@ -613,13 +658,13 @@ mod tests {
     fn non_owner_cannot_acquire_release_write_renew_reclaim() {
         // Set up an owner first so the region exists.
         let config = owner_config("non-owner-rejected", 2, 128);
-        let mut owner = Pool::new(config.clone()).expect("new owner");
+        let owner = Pool::new(config.clone()).expect("new owner");
 
         let attacher_config = PoolConfig {
             is_owner: false,
             ..config.clone()
         };
-        let mut attacher = Pool::new(attacher_config).expect("new attacher");
+        let attacher = Pool::new(attacher_config).expect("new attacher");
 
         assert!(!attacher.is_owner());
         assert_eq!(attacher.ttl_micros(), config.ttl_micros);
@@ -704,7 +749,7 @@ mod tests {
         // BEFORE any payload bytes are copied. Otherwise a hand-crafted
         // Descriptor::new could request an OOB read in release builds
         // (debug_assert is stripped).
-        let mut pool = Pool::new(owner_config("size-mismatch", 1, 1024)).expect("new");
+        let pool = Pool::new(owner_config("size-mismatch", 1, 1024)).expect("new");
         let lease = pool.acquire(Duration::from_secs(1)).expect("acquire");
         let descriptor = pool.write(&lease, b"hello").expect("write");
 
@@ -748,7 +793,7 @@ mod tests {
 
     #[test]
     fn descriptor_validates_against_current_generation() {
-        let mut pool = Pool::new(owner_config("descriptor-gen", 1, 64)).expect("new");
+        let pool = Pool::new(owner_config("descriptor-gen", 1, 64)).expect("new");
         let lease_a = pool.acquire(Duration::from_secs(1)).expect("a");
         let descriptor_a = pool.write(&lease_a, b"alpha").expect("write a");
         pool.release(&lease_a).expect("release a");
@@ -763,5 +808,63 @@ mod tests {
         assert!(matches!(err, TesseraPoolError::StaleHandle { .. }));
 
         pool.release(&lease_b).expect("release b");
+    }
+
+    // --- Concurrency (Send + Sync) ---------------------------------
+    // These won't compile unless `Pool: Send + Sync`, so they double as
+    // a compile-time assertion of the `unsafe impl`s above.
+
+    #[test]
+    fn concurrent_acquire_write_release_across_threads() {
+        use std::sync::Arc;
+        // 8 slots, 4 threads → real contention on the free list and the
+        // per-slot locks.
+        let pool = Arc::new(Pool::new(owner_config("concurrent-arr", 8, 256)).expect("new"));
+        let mut handles = Vec::new();
+        for t in 0..4u32 {
+            let p = Arc::clone(&pool);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..250u32 {
+                    let lease = p.acquire(Duration::from_secs(10)).expect("acquire");
+                    let payload = format!("t{t}-i{i}").into_bytes();
+                    let desc = p.write(&lease, &payload).expect("write");
+                    // Owner can read its own slot back while it holds the lease.
+                    let read = p.read_payload(&desc).expect("read");
+                    assert_eq!(read, payload);
+                    p.release(&lease).expect("release");
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
+        // Every lease released → no slots in use, all returned to the pool.
+        assert_eq!(pool.in_use_count().expect("in_use"), 0);
+    }
+
+    #[test]
+    fn concurrent_reads_during_mutation_churn() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let pool = Arc::new(Pool::new(owner_config("concurrent-read", 4, 256)).expect("new"));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // Reader thread hammers in_use_count while the main thread churns
+        // acquire/release. Must never tear / panic / exceed slot_count.
+        let pr = Arc::clone(&pool);
+        let sr = Arc::clone(&stop);
+        let reader = std::thread::spawn(move || {
+            while !sr.load(Ordering::Relaxed) {
+                let n = pr.in_use_count().expect("in_use");
+                assert!(n <= 4, "in_use_count {n} exceeds slot_count");
+            }
+        });
+
+        for _ in 0..1000 {
+            let lease = pool.acquire(Duration::from_secs(10)).expect("acquire");
+            pool.release(&lease).expect("release");
+        }
+        stop.store(true, Ordering::Relaxed);
+        reader.join().expect("reader panicked");
     }
 }

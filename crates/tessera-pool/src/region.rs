@@ -322,13 +322,17 @@ impl Region {
     /// `slot_index` is out of range. (Owner-only logically; not
     /// enforced here because the Pool layer enforces single-writer-
     /// lease before calling in.)
-    pub fn write_slot_meta(&mut self, slot_index: u32, meta: SlotMeta) -> Result<()> {
+    pub fn write_slot_meta(&self, slot_index: u32, meta: SlotMeta) -> Result<()> {
         self.check_slot_index(slot_index)?;
         let offset = slot_meta_offset(slot_index);
         let meta_bytes = bytemuck::bytes_of(&meta);
-        // SAFETY: offset + SIZE <= region size (see read_slot_meta);
-        // we hold &mut self so no other reader/writer is racing in
-        // this process.
+        // SAFETY: offset + SIZE <= region size (see read_slot_meta).
+        // This is `&self`: in-process exclusion against a concurrent
+        // reader/writer of the SAME slot is provided by the caller
+        // (`Pool` holds `slot_locks[slot_index]` across the
+        // read-validate-write). Cross-process writers are excluded by
+        // the single-writer-lease protocol. Writing through the mmap
+        // base pointer is sound from any thread (process-global).
         unsafe {
             let dst = self.shmem.as_ptr().add(offset);
             core::ptr::copy_nonoverlapping(meta_bytes.as_ptr(), dst, SlotMeta::SIZE);
@@ -343,7 +347,7 @@ impl Region {
     /// exceeds the slot capacity (the Pool layer rejects oversized
     /// payloads with `OversizedPayload` earlier in the chain; this
     /// is defense in depth at the unsafe boundary).
-    pub fn write_slot_payload(&mut self, slot_index: u32, bytes: &[u8]) -> Result<()> {
+    pub fn write_slot_payload(&self, slot_index: u32, bytes: &[u8]) -> Result<()> {
         self.check_slot_index(slot_index)?;
         if bytes.len() > self.slot_size_bytes as usize {
             return Err(TesseraPoolError::Region(format!(
@@ -354,8 +358,10 @@ impl Region {
         }
         let offset = slot_payload_offset(slot_index, self.slot_count, self.slot_size_bytes);
         // SAFETY: slot_index verified in range, bytes.len() verified
-        // ≤ slot_size_bytes; we hold &mut self so no concurrent
-        // access in-process.
+        // ≤ slot_size_bytes. `&self`: in-process exclusion for this
+        // slot is held by the caller (`Pool::write` holds
+        // `slot_locks[slot_index]`); cross-process exclusion is the
+        // single-writer-lease protocol.
         unsafe {
             let dst = self.shmem.as_ptr().add(offset);
             core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
@@ -386,9 +392,12 @@ impl Region {
         }
         let offset = slot_payload_offset(slot_index, self.slot_count, self.slot_size_bytes);
         let mut out = vec![0u8; payload_len as usize];
-        // SAFETY: bounds verified above; we hold &self so no in-process
-        // writer is racing this region (owner-side writes go through
-        // &mut self elsewhere).
+        // SAFETY: bounds verified above. In-process exclusion against a
+        // concurrent writer of this slot is held by the caller
+        // (`Pool::read_payload` holds `slot_locks[slot_index]` across
+        // the validate-then-copy); cross-process tearing is prevented by
+        // the generation check + single-writer-lease protocol. Reading
+        // through the mmap base pointer is sound from any thread.
         unsafe {
             let src = self.shmem.as_ptr().add(offset);
             core::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), payload_len as usize);
@@ -657,7 +666,7 @@ mod tests {
     #[test]
     fn write_then_read_slot_meta_roundtrips() {
         let handle = unique_handle("meta-roundtrip");
-        let mut region = Region::create(&handle, 2, 256, 30_000_000, false).expect("create");
+        let region = Region::create(&handle, 2, 256, 30_000_000, false).expect("create");
         let meta = SlotMeta {
             lease_id_high: 0x1122_3344_5566_7788,
             lease_id_low: 0x99AA_BBCC_DDEE_FF00,
@@ -681,7 +690,7 @@ mod tests {
     #[test]
     fn write_then_read_slot_payload_roundtrips() {
         let handle = unique_handle("payload-roundtrip");
-        let mut region = Region::create(&handle, 2, 64, 30_000_000, false).expect("create");
+        let region = Region::create(&handle, 2, 64, 30_000_000, false).expect("create");
         let payload: Vec<u8> = (0..32).collect();
         region.write_slot_payload(0, &payload).expect("write payload");
         let read = region.read_slot_payload(0, 32).expect("read");
@@ -698,7 +707,7 @@ mod tests {
         // (not the creator's Region object). Validates that name
         // derivation alone is sufficient to coordinate.
         let handle = unique_handle("cross-attach");
-        let mut creator = Region::create(&handle, 4, 128, 60_000_000, false).expect("create");
+        let creator = Region::create(&handle, 4, 128, 60_000_000, false).expect("create");
         creator.write_slot_payload(2, b"hello attacher").expect("write");
 
         let attacher = Region::attach(&handle, 4, 128).expect("attach");
