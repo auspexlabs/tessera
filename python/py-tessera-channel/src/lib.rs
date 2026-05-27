@@ -84,7 +84,7 @@ fn parse_role(s: &str) -> PyResult<ChannelRole> {
 ///              role="sender") as chan:
 ///     chan.send(b"hello channel")
 /// ```
-#[pyclass(name = "Channel", module = "tessera_channel", unsendable)]
+#[pyclass(name = "Channel", module = "tessera_channel")]
 struct PyChannel {
     inner: Mutex<Option<RustChannel>>,
     role: ChannelRole,

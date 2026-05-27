@@ -185,7 +185,7 @@ impl PyReaderStats {
 /// After `Ring.close()` flips the flag, subsequent `publish` calls
 /// raise `TesseraRingError("Ring is closed")` — Codex P2 fix on PR #2
 /// (`d467b14`).
-#[pyclass(name = "Writer", module = "tessera_ring", unsendable)]
+#[pyclass(name = "Writer", module = "tessera_ring")]
 struct PyWriter {
     inner: RustWriter,
     closed: Arc<AtomicBool>,
@@ -227,7 +227,7 @@ impl PyWriter {
 /// `Arc<Region>` clone, so the underlying SHM mapping stays alive
 /// until this PyReader is also dropped; we just block API access at
 /// the facade.
-#[pyclass(name = "Reader", module = "tessera_ring", unsendable)]
+#[pyclass(name = "Reader", module = "tessera_ring")]
 struct PyReader {
     inner: Mutex<RustReader>,
     section_id: u32,
@@ -326,7 +326,7 @@ impl PyReader {
 /// `sections` is a list of `(section_id, slot_count, slot_size_bytes)`
 /// 3-tuples. The library does not classify event bytes — sections are
 /// caller-named logical streams inside one Ring region.
-#[pyclass(name = "Ring", module = "tessera_ring", unsendable)]
+#[pyclass(name = "Ring", module = "tessera_ring")]
 struct PyRing {
     // Option<Ring> so close() / __exit__ can deterministically drop
     // the inner Ring; after close, operations raise TesseraRingError.

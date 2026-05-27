@@ -70,6 +70,20 @@ pub struct Region {
     manually_unlinked: bool,
 }
 
+// SAFETY: `Region` is `!Send + !Sync` by default because `Shmem` holds a
+// raw pointer. The pointer addresses a process-global mmap valid from any
+// thread. Ring's slot accessors use the seqlock + atomic-position
+// protocol (`crate::region` read/write helpers) that is correct under N
+// concurrent writers and M concurrent readers by design — that is the
+// whole point of the lossy broadcast ring. Per-reader cursor/drop state
+// lives in `Reader` (not here) and is `&mut self`-guarded, so the facade
+// serializes a single reader handle. Drop is a thread-agnostic
+// `munmap`/`shm_unlink`. Sharing `&Region` and moving `Region` across
+// threads are therefore sound; `Ring` / `Writer` / `Reader` inherit
+// `Send + Sync` through their `Arc<Region>`.
+unsafe impl Send for Region {}
+unsafe impl Sync for Region {}
+
 impl core::fmt::Debug for Region {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Region")

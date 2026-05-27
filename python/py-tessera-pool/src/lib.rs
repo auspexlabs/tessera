@@ -225,7 +225,7 @@ fn _descriptor_from_bytes(
 ///     # hand descriptor across IPC; worker calls pool.read_payload(descriptor)
 ///     pool.release(lease)
 /// ```
-#[pyclass(name = "Pool", module = "tessera_pool", unsendable)]
+#[pyclass(name = "Pool", module = "tessera_pool")]
 struct PyPool {
     // Interior mutability: PyO3 method receivers are &self, but the
     // underlying RustPool needs &mut for mutations. parking_lot::Mutex

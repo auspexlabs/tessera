@@ -16,6 +16,7 @@ name = "tessera_channel"
 blake3 = { workspace = true }
 bytemuck = { version = "1.16", features = ["derive", "min_const_generics"] }
 libc = "0.2"
+parking_lot = "0.12"
 shared_memory = "0.12"
 thiserror = "1"
 

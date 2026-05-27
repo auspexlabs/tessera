@@ -546,6 +546,45 @@ mod tests {
     }
 
     #[test]
+    fn shared_writer_handle_across_threads() {
+        // Shares ONE Writer (via clone) across threads — only compiles
+        // if `Writer: Send + Sync`. Section is sized so 800 events fit
+        // without wrap, so a reader started at cursor 0 must see all of
+        // them with zero drops, proving the seqlock multi-writer path is
+        // correct through a single shared handle.
+        use std::thread;
+        let cfg = RingConfig {
+            description: unique_description("shared-writer"),
+            sections: vec![SectionConfig::new(0, 4096, 64)],
+            is_owner: true,
+            force_recreate: false,
+        };
+        let ring = Ring::open(cfg).expect("open");
+        let mut reader = ring.reader(0).expect("reader"); // cursor starts at 0
+        let writer = ring.writer();
+
+        let n_threads = 4u32;
+        let per = 200u32;
+        let mut handles = Vec::new();
+        for t in 0..n_threads {
+            let w = writer.clone();
+            handles.push(thread::spawn(move || {
+                for i in 0..per {
+                    w.publish(0, format!("t{t}-{i}").as_bytes()).expect("publish");
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("writer thread panicked");
+        }
+
+        let total = (n_threads * per) as usize; // 800, fits in 4096 slots
+        let events = reader.poll().expect("poll");
+        assert_eq!(events.len(), total, "all events visible, none overwritten");
+        assert_eq!(reader.dropped(), 0);
+    }
+
+    #[test]
     fn multiple_publishes_arrive_in_order() {
         let cfg = RingConfig {
             description: unique_description("ordered-publishes"),

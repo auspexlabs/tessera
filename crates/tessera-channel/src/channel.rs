@@ -14,6 +14,8 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use parking_lot::Mutex;
+
 use crate::error::{Result, TesseraChannelError};
 use crate::namespace::NamespaceHandle;
 use crate::region::Region;
@@ -48,7 +50,29 @@ enum RecvOutcome {
 pub struct Channel {
     region: Arc<Region>,
     role: ChannelRole,
+    /// Serializes the single-consumer dequeue. The MPSC send path is
+    /// concurrency-safe by design (CAS on `tail`), but `recv`'s
+    /// load-head → copy-slot → clear-ready → advance-head sequence is
+    /// **not** safe under two concurrent receivers (one could free a
+    /// slot the other is still copying). This lock makes concurrent
+    /// `recv`/`try_recv`/`recv_timeout` on the same region serialize
+    /// rather than race. `Arc` so it is shared across `Channel` clones
+    /// of the same receiver. Senders never take it, so a `recv` blocked
+    /// holding it never impedes a sender's progress (Constraint 2).
+    recv_lock: Arc<Mutex<()>>,
 }
+
+// SAFETY: `Channel` is `!Send + !Sync` by default because `Arc<Region>`
+// wraps a `Shmem` raw pointer. The pointer addresses a process-global
+// mmap valid from any thread. The send path is multi-producer-safe by
+// the CAS-on-`tail` + per-slot `sequence`/`ready` protocol (designed for
+// concurrent senders across threads and processes). The single-consumer
+// dequeue is serialized in-process by `recv_lock`; cross-process there is
+// only ever one receiver (the region creator). Drop is a thread-agnostic
+// `munmap`/`shm_unlink`. Hence moving a `Channel` between threads and
+// sharing `&Channel` across threads are sound.
+unsafe impl Send for Channel {}
+unsafe impl Sync for Channel {}
 
 impl Channel {
     /// Open a Channel per the config: BLAKE3-derive the namespace
@@ -72,6 +96,7 @@ impl Channel {
         Ok(Self {
             region: Arc::new(region),
             role: config.role,
+            recv_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -285,6 +310,9 @@ impl Channel {
     /// Role: must be opened as `Receiver`.
     pub fn recv(&self) -> Result<Vec<u8>> {
         self.require_role(ChannelRole::Receiver)?;
+        // Serialize concurrent receivers (held across the wait; only
+        // other receivers contend — senders never take this lock).
+        let _recv_guard = self.recv_lock.lock();
         loop {
             match self.try_recv_inner()? {
                 RecvOutcome::Got(msg) => return Ok(msg),
@@ -320,6 +348,7 @@ impl Channel {
     /// Role: must be opened as `Receiver`.
     pub fn try_recv(&self) -> Result<Vec<u8>> {
         self.require_role(ChannelRole::Receiver)?;
+        let _recv_guard = self.recv_lock.lock();
         match self.try_recv_inner()? {
             RecvOutcome::Got(msg) => Ok(msg),
             RecvOutcome::Empty | RecvOutcome::NotReady => {
@@ -334,6 +363,7 @@ impl Channel {
     /// Role: must be opened as `Receiver`.
     pub fn recv_timeout(&self, timeout: Duration) -> Result<Vec<u8>> {
         self.require_role(ChannelRole::Receiver)?;
+        let _recv_guard = self.recv_lock.lock();
         let deadline = Instant::now() + timeout;
         loop {
             match self.try_recv_inner()? {
@@ -475,6 +505,41 @@ mod tests {
         })
         .expect("sender open");
         (receiver, sender)
+    }
+
+    #[test]
+    fn shared_sender_handle_across_threads() {
+        // Shares ONE sender Channel (via clone) across threads — only
+        // compiles if `Channel: Send + Sync`, and proves the in-process
+        // multi-producer path works through a single shared handle (not
+        // just one-handle-per-thread like the other concurrency tests).
+        use std::thread;
+        let (receiver, sender) = open_receiver_and_sender("shared-sender", 1024, 64);
+        let n_threads = 4u32;
+        let per = 100u32;
+        let total = (n_threads * per) as usize; // 400 < slot_count, fits without draining
+
+        let mut handles = Vec::new();
+        for t in 0..n_threads {
+            let s = sender.clone();
+            handles.push(thread::spawn(move || {
+                for i in 0..per {
+                    s.send(format!("t{t}-{i}").as_bytes()).expect("send");
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("sender thread panicked");
+        }
+
+        let mut got = 0usize;
+        while got < total {
+            receiver.recv().expect("recv");
+            got += 1;
+        }
+        assert_eq!(got, total);
+        let (head, tail) = receiver.positions();
+        assert_eq!(head, tail, "queue should be fully drained");
     }
 
     #[test]
