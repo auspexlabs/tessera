@@ -10,7 +10,7 @@
 //! `sequence` cross-check; no seqlock retry is needed on the read side
 //! because only one Receiver consumes.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -60,6 +60,12 @@ pub struct Channel {
     /// of the same receiver. Senders never take it, so a `recv` blocked
     /// holding it never impedes a sender's progress (Constraint 2).
     recv_lock: Arc<Mutex<()>>,
+    /// Set by `mark_closed()` when the owning facade closes/drops.
+    /// Blocking `send`/`recv` wait loops check it each iteration and
+    /// return `Closed` promptly. `Arc` so it is shared across `Channel`
+    /// clones of the same region (closing one handle cancels a blocking
+    /// op on another clone).
+    closed: Arc<AtomicBool>,
 }
 
 // SAFETY: `Channel` is `!Send + !Sync` by default because `Arc<Region>`
@@ -97,12 +103,26 @@ impl Channel {
             region: Arc::new(region),
             role: config.role,
             recv_lock: Arc::new(Mutex::new(())),
+            closed: Arc::new(AtomicBool::new(false)),
         })
     }
 
     /// Role this Channel handle was opened with.
     pub fn role(&self) -> ChannelRole {
         self.role
+    }
+
+    /// Mark the Channel closed. A thread blocked in `send`/`recv`
+    /// observes this on its next loop iteration and returns `Closed`.
+    /// Idempotent. Called by the facade on `close()` / drop before it
+    /// releases its handle; cross-clone via the shared `Arc`.
+    pub fn mark_closed(&self) {
+        self.closed.store(true, Ordering::Release);
+    }
+
+    /// Whether `mark_closed` has been called.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
     }
 
     /// True iff this handle was opened as the region creator (Receiver).
@@ -140,6 +160,9 @@ impl Channel {
         self.require_role(ChannelRole::Sender)?;
         self.validate_payload_len(bytes.len())?;
         loop {
+            if self.closed.load(Ordering::Acquire) {
+                return Err(TesseraChannelError::Closed);
+            }
             if self.try_send_inner(bytes)? {
                 return Ok(());
             }
@@ -184,6 +207,9 @@ impl Channel {
         self.validate_payload_len(bytes.len())?;
         let deadline = Instant::now() + timeout;
         loop {
+            if self.closed.load(Ordering::Acquire) {
+                return Err(TesseraChannelError::Closed);
+            }
             if self.try_send_inner(bytes)? {
                 return Ok(());
             }
@@ -314,6 +340,9 @@ impl Channel {
         // other receivers contend — senders never take this lock).
         let _recv_guard = self.recv_lock.lock();
         loop {
+            if self.closed.load(Ordering::Acquire) {
+                return Err(TesseraChannelError::Closed);
+            }
             match self.try_recv_inner()? {
                 RecvOutcome::Got(msg) => return Ok(msg),
                 // Empty (head == tail) OR NotReady (head < tail but
@@ -366,6 +395,9 @@ impl Channel {
         let _recv_guard = self.recv_lock.lock();
         let deadline = Instant::now() + timeout;
         loop {
+            if self.closed.load(Ordering::Acquire) {
+                return Err(TesseraChannelError::Closed);
+            }
             match self.try_recv_inner()? {
                 RecvOutcome::Got(msg) => return Ok(msg),
                 RecvOutcome::Empty | RecvOutcome::NotReady => {

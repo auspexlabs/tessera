@@ -9,6 +9,7 @@
 //! The facade owns ergonomics only — every data operation delegates
 //! to the Rust core. No serialization happens in Python.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -232,11 +233,16 @@ struct PyPool {
     // is cheap and re-entrant-free (so we won't accidentally deadlock
     // ourselves).
     //
-    // Option<RustPool> so `close()` / `__exit__` can deterministically
-    // drop the inner Pool (which unlinks the SHM region in its Drop
-    // impl) without relying on Python's GC timing. After close, all
-    // operations return TesseraPoolError("Pool is closed").
-    inner: Mutex<Option<RustPool>>,
+    // The core Pool is held behind an `Arc` so an in-flight operation
+    // can clone a reference out from under the lifecycle lock, release
+    // the lock, and run WITHOUT holding it — that's what lets a blocking
+    // `acquire` (GIL released via allow_threads) run concurrently with a
+    // `release` on another thread (Constraint 2), and lets `close()`
+    // proceed while an op is in flight. `Option` so `close()` drops the
+    // facade's owner reference; the actual `munmap`/`shm_unlink` happens
+    // when the last `Arc` (incl. any in-flight clone) drops. The Mutex
+    // is held only briefly to clone/take the Arc — never across an op.
+    inner: Mutex<Option<Arc<RustPool>>>,
     // Cached so getters don't have to lock.
     is_owner: bool,
     slot_count: u32,
@@ -245,29 +251,15 @@ struct PyPool {
 }
 
 impl PyPool {
-    /// Locked-mutable access to the inner Pool, or `Pool is closed` if
-    /// the user has already exited the context manager.
-    fn with_inner_mut<R>(
-        &self,
-        op: impl FnOnce(&mut RustPool) -> Result<R, RustPoolError>,
-    ) -> PyResult<R> {
-        let mut guard = self.inner.lock();
-        let pool = guard
-            .as_mut()
-            .ok_or_else(|| TesseraPoolError::new_err("Pool is closed"))?;
-        op(pool).map_err(map_err)
-    }
-
-    /// Locked-immutable access (only `read_payload` uses this).
-    fn with_inner<R>(
-        &self,
-        op: impl FnOnce(&RustPool) -> Result<R, RustPoolError>,
-    ) -> PyResult<R> {
-        let guard = self.inner.lock();
-        let pool = guard
+    /// Clone the core `Arc` out from under the lifecycle lock (or
+    /// `Pool is closed`). The caller then operates on the clone with the
+    /// facade lock released, so blocking ops don't wedge other threads.
+    fn pool(&self) -> PyResult<Arc<RustPool>> {
+        self.inner
+            .lock()
             .as_ref()
-            .ok_or_else(|| TesseraPoolError::new_err("Pool is closed"))?;
-        op(pool).map_err(map_err)
+            .cloned()
+            .ok_or_else(|| TesseraPoolError::new_err("Pool is closed"))
     }
 }
 
@@ -322,7 +314,7 @@ impl PyPool {
             slot_count: pool.slot_count(),
             slot_size_bytes: pool.slot_size_bytes(),
             ttl_micros: pool.ttl_micros(),
-            inner: Mutex::new(Some(pool)),
+            inner: Mutex::new(Some(Arc::new(pool))),
         })
     }
 
@@ -352,7 +344,7 @@ impl PyPool {
 
     /// Current count of leased slots. Useful for monitoring.
     fn in_use_count(&self) -> PyResult<u32> {
-        self.with_inner(|p| p.in_use_count())
+        self.pool()?.in_use_count().map_err(map_err)
     }
 
     /// True if the Pool has been closed (either via `close()` or by
@@ -365,13 +357,18 @@ impl PyPool {
     /// Acquire one free slot (owner-only). Blocks up to
     /// `timeout_seconds` for availability.
     #[pyo3(signature = (timeout_seconds=30.0))]
-    fn acquire(&self, timeout_seconds: f64) -> PyResult<PyLease> {
+    fn acquire(&self, py: Python<'_>, timeout_seconds: f64) -> PyResult<PyLease> {
         validate_seconds("timeout_seconds", timeout_seconds, /*allow_zero=*/ true)?;
         // Safe: validate_seconds confirmed value is finite and within
         // Duration's safe range, so from_secs_f64 cannot panic.
         let timeout = Duration::from_secs_f64(timeout_seconds);
-        self.with_inner_mut(|p| p.acquire(timeout))
-            .map(|inner| PyLease { inner })
+        let pool = self.pool()?;
+        // Release the GIL while blocking: another thread must be able to
+        // run `release` (or `close`) to free a slot / cancel us. The
+        // facade lock is already dropped (we hold only an Arc clone), so
+        // nothing here wedges another thread.
+        let lease = py.allow_threads(|| pool.acquire(timeout)).map_err(map_err)?;
+        Ok(PyLease { inner: lease })
     }
 
     /// Write a payload into the leased slot. One-shot per lease;
@@ -379,18 +376,18 @@ impl PyPool {
     /// Descriptor suitable for cross-IPC handoff.
     fn write<'py>(
         &self,
-        _py: Python<'py>,
         lease: &PyLease,
         payload: &Bound<'py, PyBytes>,
     ) -> PyResult<PyDescriptor> {
-        // v0.1: hold the GIL through the copy. The bytes are slot-bounded
-        // (configurable per pool) so worst-case latency is bounded.
-        // Later: `py.allow_threads(...)` after pulling out an owned
-        // payload bytes Vec; needs care around the Send bound on the
-        // captured mutex guard.
+        // Non-blocking: holds the GIL for the slot-bounded copy (no
+        // allow_threads because `bytes` borrows the GIL-bound PyBytes),
+        // but does NOT hold the facade lock — so it never wedges a
+        // concurrent acquire/close.
+        let pool = self.pool()?;
         let bytes = payload.as_bytes();
-        self.with_inner_mut(|p| p.write(&lease.inner, bytes))
+        pool.write(&lease.inner, bytes)
             .map(|inner| PyDescriptor { inner })
+            .map_err(map_err)
     }
 
     /// Read the bytes referenced by a descriptor. Available to both
@@ -401,25 +398,25 @@ impl PyPool {
         py: Python<'py>,
         descriptor: &PyDescriptor,
     ) -> PyResult<Bound<'py, PyBytes>> {
-        let bytes = self.with_inner(|p| p.read_payload(&descriptor.inner))?;
+        let bytes = self.pool()?.read_payload(&descriptor.inner).map_err(map_err)?;
         Ok(PyBytes::new_bound(py, &bytes))
     }
 
     /// Release a leased slot (owner-only).
     fn release(&self, lease: &PyLease) -> PyResult<()> {
-        self.with_inner_mut(|p| p.release(&lease.inner))
+        self.pool()?.release(&lease.inner).map_err(map_err)
     }
 
     /// Renew a lease's `acquired_at` (owner-only). Use during long
     /// owner-side operations to prevent reclaim_stale from reclaiming.
     fn renew(&self, lease: &PyLease) -> PyResult<()> {
-        self.with_inner_mut(|p| p.renew(&lease.inner))
+        self.pool()?.renew(&lease.inner).map_err(map_err)
     }
 
     /// Reclaim slots whose lease has been outstanding longer than the
     /// configured TTL. Returns the count reclaimed. Owner-only.
     fn reclaim_stale(&self) -> PyResult<u32> {
-        self.with_inner_mut(|p| p.reclaim_stale())
+        self.pool()?.reclaim_stale().map_err(map_err)
     }
 
     /// Drop the underlying Rust Pool, unlinking the SHM region (for
@@ -429,9 +426,16 @@ impl PyPool {
     /// After close, all other operations raise TesseraPoolError("Pool
     /// is closed").
     fn close(&self) -> PyResult<()> {
-        // Taking the Option out of the Mutex drops the RustPool here;
-        // Shmem's Drop runs the underlying shm_unlink for owner mappings.
-        self.inner.lock().take();
+        // Mark closed first so any in-flight blocking `acquire` (on
+        // another thread, holding its own Arc clone) is woken with a
+        // clean Closed error. Then drop the facade's Arc reference; the
+        // SHM region is unmapped/unlinked when the last Arc (including
+        // that in-flight clone) drops — never under a live op.
+        let mut guard = self.inner.lock();
+        if let Some(pool) = guard.as_ref() {
+            pool.mark_closed();
+        }
+        guard.take();
         Ok(())
     }
 

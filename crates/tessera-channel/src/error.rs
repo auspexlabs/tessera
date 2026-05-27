@@ -101,6 +101,13 @@ pub enum TesseraChannelError {
         /// The role the called operation requires.
         required: ChannelRoleSnapshot,
     },
+
+    /// The Channel was closed (its facade dropped / `close()`d) while a
+    /// blocking `send` / `recv` was waiting. The blocked call returns
+    /// this promptly when another thread closes the Channel, rather than
+    /// blocking to its timeout (or forever for the un-timed variants).
+    #[error("Channel is closed")]
+    Closed,
 }
 
 /// Snapshot of a `ChannelRole` value, suitable for embedding in

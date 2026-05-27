@@ -93,15 +93,16 @@ struct PyChannel {
 }
 
 impl PyChannel {
-    fn with_inner<R>(
-        &self,
-        op: impl FnOnce(&RustChannel) -> Result<R, RustChannelError>,
-    ) -> PyResult<R> {
-        let guard = self.inner.lock();
-        let chan = guard
+    /// Clone the core Channel out from under the lifecycle lock (cheap —
+    /// it's `Arc`-backed). The caller operates on the clone with the
+    /// facade lock released, so a blocking `send`/`recv` (GIL released)
+    /// never wedges a peer or `close()`.
+    fn channel(&self) -> PyResult<RustChannel> {
+        self.inner
+            .lock()
             .as_ref()
-            .ok_or_else(|| TesseraChannelError::new_err("Channel is closed"))?;
-        op(chan).map_err(map_err)
+            .cloned()
+            .ok_or_else(|| TesseraChannelError::new_err("Channel is closed"))
     }
 }
 
@@ -183,44 +184,55 @@ impl PyChannel {
 
     /// Snapshot of `(head, tail)` positions. Useful for diagnostics.
     fn positions(&self) -> PyResult<(u64, u64)> {
-        self.with_inner(|c| Ok(c.positions()))
+        Ok(self.channel()?.positions())
     }
 
     /// Publish one message. Blocks until room is available.
     /// Receiver-side handles raise `TesseraChannelError`.
-    fn send(&self, bytes: &Bound<'_, PyBytes>) -> PyResult<()> {
-        let buf = bytes.as_bytes();
-        self.with_inner(|c| c.send(buf))
+    fn send(&self, py: Python<'_>, bytes: &Bound<'_, PyBytes>) -> PyResult<()> {
+        let chan = self.channel()?;
+        // Own the bytes so the blocking send can run with the GIL
+        // released (a borrowed PyBytes slice can't cross allow_threads).
+        // Releasing the GIL is required: a blocked send must let the
+        // receiver thread drain (or close()) to make progress.
+        let buf = bytes.as_bytes().to_vec();
+        py.allow_threads(|| chan.send(&buf)).map_err(map_err)
     }
 
     /// Non-blocking publish. Raises `TesseraChannelError` with
     /// `"Channel is full"` if the queue is full at call time.
     fn try_send(&self, bytes: &Bound<'_, PyBytes>) -> PyResult<()> {
-        let buf = bytes.as_bytes();
-        self.with_inner(|c| c.try_send(buf))
+        let chan = self.channel()?;
+        chan.try_send(bytes.as_bytes()).map_err(map_err)
     }
 
     /// Bounded-blocking publish. Raises `TesseraChannelError` with
     /// `"timed out"` on budget exhaustion.
-    fn send_timeout(&self, bytes: &Bound<'_, PyBytes>, timeout_seconds: f64) -> PyResult<()> {
+    fn send_timeout(
+        &self,
+        py: Python<'_>,
+        bytes: &Bound<'_, PyBytes>,
+        timeout_seconds: f64,
+    ) -> PyResult<()> {
         validate_seconds("timeout_seconds", timeout_seconds, /*allow_zero=*/ true)?;
-        // SAFETY (numeric): validate_seconds confirmed value is
-        // finite + within Duration's safe range.
         let timeout = Duration::from_secs_f64(timeout_seconds);
-        let buf = bytes.as_bytes();
-        self.with_inner(|c| c.send_timeout(buf, timeout))
+        let chan = self.channel()?;
+        let buf = bytes.as_bytes().to_vec();
+        py.allow_threads(|| chan.send_timeout(&buf, timeout)).map_err(map_err)
     }
 
     /// Dequeue one message. Blocks until a message is available.
     fn recv<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let bytes = self.with_inner(|c| c.recv())?;
+        let chan = self.channel()?;
+        let bytes = py.allow_threads(|| chan.recv()).map_err(map_err)?;
         Ok(PyBytes::new_bound(py, &bytes))
     }
 
     /// Non-blocking dequeue. Raises `TesseraChannelError` with
     /// `"Channel is empty"` if no message is available.
     fn try_recv<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let bytes = self.with_inner(|c| c.try_recv())?;
+        let chan = self.channel()?;
+        let bytes = chan.try_recv().map_err(map_err)?;
         Ok(PyBytes::new_bound(py, &bytes))
     }
 
@@ -233,15 +245,22 @@ impl PyChannel {
     ) -> PyResult<Bound<'py, PyBytes>> {
         validate_seconds("timeout_seconds", timeout_seconds, /*allow_zero=*/ true)?;
         let timeout = Duration::from_secs_f64(timeout_seconds);
-        let bytes = self.with_inner(|c| c.recv_timeout(timeout))?;
+        let chan = self.channel()?;
+        let bytes = py.allow_threads(|| chan.recv_timeout(timeout)).map_err(map_err)?;
         Ok(PyBytes::new_bound(py, &bytes))
     }
 
     /// Drop the underlying Rust Channel, unlinking the SHM region
     /// (for Receiver-role Channels) and detaching the mapping (for
-    /// Sender-role). Idempotent.
+    /// Sender-role). Idempotent. Marks the Channel closed first so an
+    /// in-flight blocking send/recv on another thread is woken with a
+    /// clean Closed error before the region is unmapped.
     fn close(&self) -> PyResult<()> {
-        self.inner.lock().take();
+        let mut guard = self.inner.lock();
+        if let Some(chan) = guard.as_ref() {
+            chan.mark_closed();
+        }
+        guard.take();
         Ok(())
     }
 

@@ -4,6 +4,7 @@
 //! Only the owner Pool acquires, writes, releases, renews, and reclaims;
 //! attachers may only read payloads via a descriptor.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crossbeam_queue::SegQueue;
@@ -85,6 +86,13 @@ pub struct Pool {
     /// and attacher Pools; cross-*process* races are handled by the SHM
     /// generation protocol, not these locks.
     slot_locks: Box<[Mutex<()>]>,
+    /// Set by `mark_closed()` when the owning facade closes/drops. The
+    /// `acquire` wait loop checks it each iteration and returns
+    /// `Closed` promptly, so a thread blocked in `acquire` is woken when
+    /// another thread closes the Pool instead of blocking to its
+    /// timeout. Shared across `Arc<Pool>` clones (the facade holds the
+    /// Pool behind an `Arc`).
+    closed: AtomicBool,
     /// Cached TTL — for owners, copied from PoolConfig; for attachers,
     /// inherited from the SHM header.
     ttl_micros: u64,
@@ -155,6 +163,7 @@ impl Pool {
                 region,
                 owner_state: Some(OwnerState { free_slots }),
                 slot_locks,
+                closed: AtomicBool::new(false),
                 ttl_micros: config.ttl_micros,
             })
         } else {
@@ -164,6 +173,7 @@ impl Pool {
                 region,
                 owner_state: None,
                 slot_locks,
+                closed: AtomicBool::new(false),
                 ttl_micros,
             })
         }
@@ -172,6 +182,21 @@ impl Pool {
     /// True for owner Pool instances; false for attachers.
     pub fn is_owner(&self) -> bool {
         self.owner_state.is_some()
+    }
+
+    /// Mark the Pool closed. A thread blocked in `acquire` observes this
+    /// on its next loop iteration and returns `Closed`. Idempotent.
+    /// Called by the facade on `close()` / drop before it releases its
+    /// `Arc<Pool>` reference; the actual `munmap`/`shm_unlink` happens
+    /// when the last `Arc` reference (including any in-flight op's clone)
+    /// is dropped.
+    pub fn mark_closed(&self) {
+        self.closed.store(true, Ordering::Release);
+    }
+
+    /// Whether `mark_closed` has been called.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
     }
 
     /// TTL in microseconds (owner-stamped; non-owners inherit).
@@ -206,6 +231,11 @@ impl Pool {
         // No lock is held across this wait, so a concurrent `release`
         // can return a slot to the queue and unblock us (Constraint 2).
         let slot_index = loop {
+            // Cancellation: a concurrent close() wakes this wait with a
+            // clean Closed error instead of blocking to the deadline.
+            if self.closed.load(Ordering::Acquire) {
+                return Err(TesseraPoolError::Closed);
+            }
             if let Some(idx) = state.free_slots.pop() {
                 break idx;
             }

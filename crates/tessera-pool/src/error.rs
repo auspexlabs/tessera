@@ -48,6 +48,13 @@ pub enum TesseraPoolError {
     #[error("operation requires owner-side Pool (constructed with is_owner=true)")]
     OwnerOnly,
 
+    /// The Pool was closed (its facade dropped / `close()`d) while this
+    /// operation was waiting. A blocked `acquire` returns this promptly
+    /// when another thread closes the Pool, rather than blocking to its
+    /// timeout.
+    #[error("Pool is closed")]
+    Closed,
+
     /// Descriptor / lease has a generation older than the slot's
     /// current generation. The slot was reclaimed and re-leased; the
     /// holder of this descriptor must abandon it.
