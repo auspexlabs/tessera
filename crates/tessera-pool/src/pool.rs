@@ -133,13 +133,16 @@ impl Pool {
 
         let handle = NamespaceHandle::derive(&config.description);
 
-        // One mutex per slot, on both owner and attacher Pools. The
-        // attacher's geometry is validated to match the owner's in
-        // `Region::attach`, so `slot_count` indexes both consistently.
-        let slot_locks: Box<[Mutex<()>]> = (0..config.slot_count)
-            .map(|_| Mutex::new(()))
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
+        // One mutex per slot, on both owner and attacher Pools.
+        // Allocated only AFTER the region is created/attached — so a
+        // malformed or huge `slot_count` fails with the ttl / region-size
+        // / HeaderMismatch error first, instead of allocating an
+        // enormous vector (or aborting) up front (Codex PR #13 P2). The
+        // attacher's geometry is validated against the existing header in
+        // `Region::attach`, so `config.slot_count` indexes consistently.
+        let build_slot_locks = |n: u32| -> Box<[Mutex<()>]> {
+            (0..n).map(|_| Mutex::new(())).collect::<Vec<_>>().into_boxed_slice()
+        };
 
         if config.is_owner {
             if config.ttl_micros == 0 {
@@ -154,6 +157,7 @@ impl Pool {
                 config.ttl_micros,
                 config.force_recreate,
             )?;
+            let slot_locks = build_slot_locks(config.slot_count);
             // Initial free list: every slot index, in order.
             let free_slots = SegQueue::new();
             for i in 0..config.slot_count {
@@ -168,6 +172,7 @@ impl Pool {
             })
         } else {
             let region = Region::attach(&handle, config.slot_count, config.slot_size_bytes)?;
+            let slot_locks = build_slot_locks(config.slot_count);
             let ttl_micros = region.ttl_micros();
             Ok(Self {
                 region,

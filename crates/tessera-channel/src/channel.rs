@@ -377,7 +377,17 @@ impl Channel {
     /// Role: must be opened as `Receiver`.
     pub fn try_recv(&self) -> Result<Vec<u8>> {
         self.require_role(ChannelRole::Receiver)?;
-        let _recv_guard = self.recv_lock.lock();
+        // Non-blocking: if another receiver currently holds the dequeue
+        // lock, there's nothing this caller can take right now — report
+        // empty instead of blocking, preserving the non-blocking
+        // contract under shared/cloned receivers (Codex PR #13 P1).
+        let _recv_guard = match self.recv_lock.try_lock() {
+            Some(g) => g,
+            None => {
+                let head = self.region.head_atomic().load(Ordering::Acquire);
+                return Err(TesseraChannelError::ChannelEmpty { head });
+            }
+        };
         match self.try_recv_inner()? {
             RecvOutcome::Got(msg) => Ok(msg),
             RecvOutcome::Empty | RecvOutcome::NotReady => {
@@ -392,8 +402,21 @@ impl Channel {
     /// Role: must be opened as `Receiver`.
     pub fn recv_timeout(&self, timeout: Duration) -> Result<Vec<u8>> {
         self.require_role(ChannelRole::Receiver)?;
-        let _recv_guard = self.recv_lock.lock();
+        // Bound the TOTAL wait — including time spent waiting for another
+        // receiver to release the dequeue lock — by the caller's timeout
+        // (Codex PR #13 P1). The deadline is set BEFORE acquiring the
+        // lock, and the lock acquisition itself respects it.
         let deadline = Instant::now() + timeout;
+        let _recv_guard = match self.recv_lock.try_lock_until(deadline) {
+            Some(g) => g,
+            None => {
+                return Err(TesseraChannelError::Timeout {
+                    timeout_micros: timeout.as_micros() as u64,
+                    head: self.region.head_atomic().load(Ordering::Acquire),
+                    tail: self.region.tail_atomic().load(Ordering::Acquire),
+                });
+            }
+        };
         loop {
             if self.closed.load(Ordering::Acquire) {
                 return Err(TesseraChannelError::Closed);
@@ -596,6 +619,52 @@ mod tests {
         let (res, elapsed) = waiter.join().expect("waiter panicked");
         assert!(matches!(res, Err(TesseraChannelError::Closed)), "expected Closed, got {res:?}");
         assert!(elapsed < Duration::from_secs(5), "close should cancel promptly; took {elapsed:?}");
+    }
+
+    #[test]
+    fn try_recv_stays_nonblocking_behind_active_recv() {
+        // Codex PR #13 P1: while one thread is parked in recv() (holding
+        // the dequeue lock), try_recv() on a shared/cloned receiver must
+        // return ChannelEmpty promptly, not block behind the lock.
+        use std::thread;
+        use std::time::Instant;
+        let (receiver, _sender) = open_receiver_and_sender("tryrecv-nonblock", 16, 64);
+        let r = receiver.clone();
+        let waiter = thread::spawn(move || r.recv()); // blocks; holds recv_lock
+        thread::sleep(Duration::from_millis(50));
+
+        let start = Instant::now();
+        let res = receiver.try_recv();
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(res, Err(TesseraChannelError::ChannelEmpty { .. })),
+            "expected ChannelEmpty, got {res:?}"
+        );
+        assert!(elapsed < Duration::from_secs(1), "try_recv blocked behind recv: {elapsed:?}");
+
+        receiver.mark_closed(); // cancel the parked recv
+        let _ = waiter.join().expect("waiter panicked");
+    }
+
+    #[test]
+    fn recv_timeout_stays_bounded_behind_active_recv() {
+        // Codex PR #13 P1: recv_timeout's deadline must cover the time
+        // spent waiting for another receiver's lock, not start after it.
+        use std::thread;
+        use std::time::Instant;
+        let (receiver, _sender) = open_receiver_and_sender("recvto-bounded", 16, 64);
+        let r = receiver.clone();
+        let waiter = thread::spawn(move || r.recv()); // blocks; holds recv_lock
+        thread::sleep(Duration::from_millis(50));
+
+        let start = Instant::now();
+        let res = receiver.recv_timeout(Duration::from_millis(100));
+        let elapsed = start.elapsed();
+        assert!(matches!(res, Err(TesseraChannelError::Timeout { .. })), "expected Timeout, got {res:?}");
+        assert!(elapsed < Duration::from_secs(2), "recv_timeout exceeded its bound: {elapsed:?}");
+
+        receiver.mark_closed();
+        let _ = waiter.join().expect("waiter panicked");
     }
 
     #[test]
