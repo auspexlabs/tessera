@@ -36,8 +36,10 @@ so even a `Send`-not-`Sync` handle can be *called* from several Python threads
 safely (only one is in Rust at a time). The moment a blocking op releases the
 GIL (`py.allow_threads`, which Constraint 2 forces), concurrency becomes real
 and `Sync` correctness must actually hold. So: **`Send` is the baseline ask for
-every role; `Sync` is an additional claim that's only true for the genuinely
-concurrent protocols.**
+portable primitive handles; `Sync` is an additional claim that's only true for
+the genuinely concurrent protocols.** Sink owner is the explicit exception under
+consideration because it is a composite, single-threaded orchestrator rather
+than a byte-level primitive handle.
 
 ## Context
 
@@ -116,8 +118,8 @@ sufficient**; the facade must also not hold a coarse lock across the wait.
 | Channel · sender | yes | **yes** | MPSC, CAS on `tail` |
 | Channel · receiver | yes | **no** | single-receiver copy path races under concurrent `recv` |
 | Pool · owner | yes | **yes** (after refactor) | needs concurrent acquire/release; see prerequisite |
-| Pool · attacher | yes | **yes** | read-only `read_payload(&self)` |
-| Sink · owner | yes* | **no** | single-threaded by design; *or stays thread-affine |
+| Pool · attacher | yes | **yes** (after read-path protocol) | API-read-only, but `read_payload` must snapshot metadata/payload consistently |
+| Sink · owner | yes* | **no** | single-threaded by design; *or explicitly remains thread-affine |
 
 For the **`Send`-not-`Sync`** rows (Ring reader, Channel receiver, Sink owner),
 the handle may be moved across threads but concurrent calls must be prevented —
@@ -128,16 +130,22 @@ internal serialization lock on that handle.
 
 Concrete work items, per the reviews:
 
-1. **Pool core signature refactor (prerequisite).** *Both* the mutation path
-   (`acquire` / `write` / `release` / `renew` / `reclaim_stale`,
-   `crates/tessera-pool/src/pool.rs:165,295`) *and* the read path
-   (`read_payload` `:257`, `in_use_count` `:379`) are `&mut self` /
-   lock-guarded today, so the facade can only call them by holding
-   `with_inner_mut`'s mutex. For Constraint 2 they must move to **`&self` +
-   internal synchronization**, and that synchronization must cover the read
-   path too — `Region::write_slot_meta` is `&mut self` (`region.rs:325`), which
-   is exactly the exclusivity the type system gives up once the facade lock is
-   removed. Two viable shapes:
+1. **Pool core synchronization refactor (prerequisite).** The owner mutation
+   path is still `&mut self` (`acquire` / `write` / `release` / `renew` /
+   `reclaim_stale`, `crates/tessera-pool/src/pool.rs:164,207,294,320,339`),
+   while the read path is already `&self` (`read_payload` `:256`,
+   `in_use_count` `:377`). The Python facade still serializes both paths behind
+   its `Mutex` (`python/py-tessera-pool/src/lib.rs:250,262`), which prevents
+   in-process progress (`acquire` can block while holding the only lock
+   `release` needs) and masks the fact that the Rust read path has no internal
+   synchronization against owner metadata mutation.
+
+   For Constraint 2, the mutation methods must move to **`&self` + internal
+   synchronization**, and the existing `&self` read methods must use that same
+   synchronization/snapshot protocol. It is not enough to remove the facade
+   lock from `read_payload`: `Region::write_slot_meta` is `&mut self`
+   (`region.rs:325`) today, and that exclusivity is exactly what gets lost once
+   one Pool handle can be called from several host threads. Two viable shapes:
    - a **per-slot lock** held briefly for both meta-mutation and the
      validate-then-copy read (never across a wait), or
    - move `SlotMeta` to **atomics/seqlock** so reads snapshot
@@ -160,18 +168,24 @@ Once blocking ops no longer hold the lifecycle mutex, `close()` cannot simply
 drop the inner object while another thread is mid-op. Required design, two
 parts:
 
-1. **No use-after-unmap.** Hold the core behind an `Arc`; an op clones/refs the
-   `Arc` before releasing lifecycle state; `close()` marks the handle closed and
-   drops only its owner reference; the actual `munmap`/`shm_unlink` happens when
-   the last `Arc` reference drops (after in-flight ops finish).
+1. **No use-after-unmap.** Put the core and closed bit in shared facade state
+   (for example `Arc<FacadeState { core: Arc<Core>, closed: AtomicBool }>`).
+   An op clones the state/core before releasing lifecycle state; `close()` marks
+   the handle closed and drops only its owner reference; the actual
+   `munmap`/`shm_unlink` happens when the last core `Arc` reference drops
+   (after in-flight ops finish).
 2. **Cancellation (don't just prevent UAF — wake the blocked op).** The `Arc`
    scheme stops a crash but does not, by itself, unblock a thread parked in
    `recv()`, `send()` (full channel), or `acquire()` (full pool). Those wait
-   loops must poll an **atomic `closed` flag** and return a clean
+   loops must poll the shared **atomic `closed` flag** and return a clean
    `Closed`/`Cancelled` error promptly when `close()` sets it — otherwise a
    `close()` leaves peers blocking until their timeout (or forever, for the
    un-timed blocking variants). So: `close()` = set `closed` (Release) + drop
    owner `Arc` ref; every wait loop checks `closed` (Acquire) each iteration.
+
+This is local-handle cancellation. It is separate from remote peer death across
+processes, which would require an in-SHM closed/epoch/liveness signal and is not
+part of the minimum fix for the PyO3 thread-affinity panic.
 
 Specify both per primitive.
 
@@ -194,8 +208,9 @@ future host. Not recommended for a portable library.
    And the negative: concurrent `recv` on one Channel receiver / `poll` on one
    Ring reader must be either prevented or serialized, never UB.
 4. **Pool read/write meta race** — one thread `read_payload`/`in_use_count`
-   while another `acquire`/`release`/reclaims the same slots; assert no torn
-   read and no UB (the case the `&mut self` exclusivity covers today).
+   (both owner handle and attacher handle variants) while another
+   `acquire`/`release`/reclaims the same slots; assert no torn read and no UB
+   (the case the current facade lock and `&mut self` mutation path hide today).
 5. **Close cancels, not just protects** — block a thread in `recv` / full
    `send` / full `acquire`, call `close()` from another thread, assert the
    blocked op returns a clean `Closed` error **promptly** (well under its
