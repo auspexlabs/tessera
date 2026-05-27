@@ -331,6 +331,27 @@ impl Pool {
     /// owner reclaimed the slot before the descriptor holder finished
     /// consuming.
     ///
+    /// ## Concurrency contract (v0.1)
+    ///
+    /// Safe under Tessera's single-writer-lease protocol: the owner
+    /// holds the lease until the reader acks, and only reclaims a slot
+    /// whose reader is confirmed gone (crash recovery) — so a writer
+    /// never mutates a slot with a live reader. Under that protocol the
+    /// per-slot lock (same-instance) plus the generation re-check
+    /// (cross-instance / cross-process) make every read either correct
+    /// or `StaleHandle`.
+    ///
+    /// What v0.1 does **not** provide: a fully race-free payload copy if
+    /// a caller *violates* that protocol — reclaiming/reusing+rewriting a
+    /// slot in one process while another process is mid-`read_payload`.
+    /// The generation re-check detects it after the fact, but the
+    /// unsynchronized cross-process `memcpy` itself is a data race. This
+    /// matches (and exceeds, via the stale-detection) the prior in-tree
+    /// `SharedMemoryPool`, which had no generation check at all. A
+    /// race-free arbitrary-concurrent copy needs an in-SHM robust
+    /// per-slot lock — tracked for v0.2 (see
+    /// `docs/issue_facade_thread_safety.md`).
+    ///
     /// Bound-checks `descriptor.size_bytes()` against the slot's
     /// stored `payload_len` AND against the slot capacity. Descriptors
     /// can be constructed by callers via `Descriptor::new` or

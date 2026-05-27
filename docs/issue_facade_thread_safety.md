@@ -1,10 +1,52 @@
 # Issue: Tessera's concurrency contract for multi-threaded host processes
 
-**Status:** v4 — revised after three Rust reviews; seeking confirmation of the
-contract before implementation. Public README drift from review 3 was handled
-in the follow-up docs pass.
+**Status:** RESOLVED for v0.1 — implemented on branch `concurrency/send-sync-contract`
+(PR #13). One residual item consciously deferred to v0.2; see "Resolution" below.
 **Affects:** all four primitives' Python facades and their Rust cores.
 **Date:** 2026-05-26
+
+---
+
+## Resolution (v0.1 decision)
+
+Option C was implemented per the per-role table: `&self` + per-slot locks for
+Pool, `recv_lock` for the Channel receiver, seqlock `Send + Sync` for Ring,
+`Arc` facades + atomic `closed` flag + `py.allow_threads` for close/cancel,
+Sink owner kept thread-affine.
+
+**One item is deferred to v0.2, by decision:** a fully race-free payload copy
+under *arbitrary* concurrent writer + reader on the **same slot, cross-process**
+(i.e. a caller that violates the single-writer-lease protocol — reclaiming /
+reusing + rewriting a slot in one process while another is mid-`read_payload`).
+`read_payload` detects it via a generation re-check (returns `StaleHandle`), but
+the unsynchronized cross-process `memcpy` itself is a data race that a
+process-private lock cannot prevent.
+
+Rationale for deferring:
+- **Parity-plus.** This is exactly the exposure the prior in-tree
+  `certus/mp/shared_memory_pool.py` had — with *less* protection (it had no
+  generation check at all). Certus shipped on it for the whole project because
+  its protocol (owner holds the lease until the worker acks; reclaim is
+  crash-recovery only, for dead readers) means the race never occurs.
+- The contract `read_payload` documents (single-writer-lease) forbids the
+  triggering scenario, so v0.1 is sound *for the use Tessera is built for*.
+- A genuinely race-free arbitrary-concurrent cross-process copy needs an
+  **in-SHM robust per-slot lock** (atomic lock word in the shared region with
+  crashed-holder recovery, à la `PTHREAD_MUTEX_ROBUST`). That's a real,
+  recovery-laden chunk of work whose only beneficiary is a use-case outside
+  Tessera's own — appropriate as a **v0.2 portability item**, disproportionate
+  for v0.1.
+
+### v0.2 roadmap
+
+- **In-SHM robust per-slot lock for `Pool`** so `read_payload` is race-free
+  under arbitrary concurrent writer/reader across processes (broadens the
+  library beyond the single-writer-lease protocol). Tracked here.
+
+---
+
+> **Revision-history note:** the body below is the pre-resolution design write-up
+> (v1–v4) kept as the rationale of record.
 
 > **Revision history.**
 > - v1: claimed a uniform fix ("facades serialize via a `parking_lot::Mutex`,
