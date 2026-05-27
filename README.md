@@ -55,7 +55,7 @@ threads) is separated from `Sync` (call the same handle concurrently):
 | Channel receiver | ✓ | serialized (one dequeue at a time) |
 | Ring writer | ✓ | ✓ — seqlock multi-writer |
 | Ring reader | ✓ | serialized (one `poll` per reader handle) |
-| Sink owner | ✓ | thread-affine (drive from one thread) |
+| Sink owner | ✗ — thread-affine | ✗ — drive from one thread |
 
 Blocking Python methods release the GIL and hold no lifecycle lock across
 the wait, so e.g. a blocked `Pool.acquire` never prevents a `release` on
