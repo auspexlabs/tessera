@@ -12,7 +12,7 @@ and any future reorderings of the seed tuple don't perturb the hash.
 CONFIDENCE: HIGH. Pool is non-lossy and bytes-in == bytes-out is the
 explicit contract; the test exists to lock that contract over time and
 to give the downstream Certus parity test a peer baseline to compare
-against once Stage 9 (shadow-consumption PR) lands.
+against during re-import validation.
 
 How to (re-)generate the snapshot:
 

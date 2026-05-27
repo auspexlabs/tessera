@@ -9,7 +9,7 @@
 //! - `tessera_ring.TesseraRingError` — base Python exception.
 //!
 //! The facade owns ergonomics only — every data operation delegates
-//! to the Rust core. No serialization happens in Python (§3.4 lock).
+//! to the Rust core. No serialization happens in Python.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

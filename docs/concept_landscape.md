@@ -6,10 +6,8 @@ scope, and what's a future candidate. It's a living map; treat it as
 authoritative for "what category does X belong to?" questions but not
 as a roadmap commitment.
 
-**Status**: tracked reference doc, but not part of the side-doc
-authority chain (`mp_tools_open_source_extraction_2026-05-23.md` is
-still the locked spec for decisions); this is the higher-altitude
-mental model that frames where each spec'd piece sits.
+**Status**: tracked reference doc. This is the higher-altitude mental
+model for where each implemented primitive and candidate service fits.
 
 ## The categories
 
@@ -33,8 +31,8 @@ mental model that frames where each spec'd piece sits.
 |---|---|---|---|---|---|
 | **Pool** | Primitive | Non-lossy, lease/return, large opaque payloads, single-writer-per-slot, point-to-point handoff via descriptor | Hand off 64 MB training batch / parquet chunk / model snapshot between owner and worker | raw SHM | Shipped (v0.0.1) |
 | **Ring** | Primitive | Lossy, multi-writer, multi-reader broadcast, small-to-medium payloads, fire-and-forget, FIFO per section | Telemetry / metrics / log fan-out to multiple independent consumers (TUI + Prometheus + archiver) | raw SHM | Shipped (v0.0.1) |
-| **Channel** | Primitive | Non-lossy, multi-producer / single-consumer, small typed messages, FIFO, blocking-or-fail-fast backpressure | Reliable queue: control plane, ack plane, RPC messages, anything where dropping is not OK | raw SHM | Shipped (v0.0.1) |
-| **Sink** | Service | Atomic-write-to-disk worker pool with chunking + hash integrity + optional fsync | Persist large artifacts (batches, snapshots, logs) durably from a hot-path producer without blocking it | Pool (payload) + Channel (control + ack) | In flight (PR #10) |
+| **Channel** | Primitive | Non-lossy, multi-producer / single-consumer, small byte messages, FIFO, blocking-or-fail-fast backpressure | Reliable queue: control plane, ack plane, RPC messages, anything where dropping is not OK | raw SHM | Shipped (v0.0.1) |
+| **Sink** | Service | Atomic-write-to-disk worker pool with chunking + hash integrity + optional fsync | Persist large artifacts (batches, snapshots, logs) durably from a hot-path producer without doing disk I/O inline | Pool (payload) + Channel (control + ack) | Shipped (v0.0.1) |
 
 ### Tid-bits on each
 
@@ -53,11 +51,12 @@ maintain process-local cursors and detect lapping via
 `oldest_available = latest - slot_count`. Lossy by design — no
 backpressure on writers — which is exactly what you want for
 telemetry but exactly wrong for control/RPC. Multi-section: one Ring
-region can carry independent `logs` + `metrics` + `errors` streams
-without coordination.
+region can carry independent logical streams without coordination;
+callers map stream names such as `logs` or `metrics` to integer
+`section_id` values.
 
 **Channel** — the "non-lossy queue" primitive. Fills the gap between
-Pool (too heavy / blob-shaped) and Ring (too lossy) for small typed
+Pool (too heavy / blob-shaped) and Ring (too lossy) for small byte
 messages where dropping is not acceptable. Credit-based backpressure:
 producers fail-fast / block / time out when the queue is full,
 they don't overwrite. Required by Sink's control + ack planes.
@@ -65,11 +64,12 @@ Without it, Sink either lives in-process-only or papers over the gap
 with OS pipes external to Tessera's primitive set.
 
 **Sink** — the first composite service. Reads payload bytes from a
-Pool slot, streams them to disk atomically (temp-file + rename),
-verifies via blake3. Owner spawns N worker OS processes; control via
-per-worker Channel; ack via shared MPSC Channel. Owner-held leases
-with renewal timer per §3.5.d. Chunked streaming with worker affinity
-when a payload exceeds slot_size. fsync per-submit (default off).
+Pool slot, streams them to disk atomically (temp-file + rename), and
+verifies via BLAKE3. Owner spawns N worker OS processes; control flows
+through per-worker Channel regions and acks flow through a shared MPSC
+Channel. The owner cooperatively drains acks and renews leases inside
+`submit` / `flush`. Chunked streaming handles payloads larger than one
+Pool slot. `fsync` is per-submit and defaults off.
 
 ## Future candidates — not in v0.1, may land in v0.2+
 
@@ -98,9 +98,9 @@ loop has a barrier-like construct over multiprocessing.Event. Easy to
 build atop Channel once Channel exists.
 
 **Shared KV / map** — concurrent hashmap over SHM, with eviction.
-The Tessera Pool roadmap (§5.5) already mentions "typed slot views"
-and "eviction-aware lease shapes" as forward-compatible additions —
-that's the direction this composite would go.
+The Pool roadmap already mentions "typed slot views" and
+"eviction-aware lease shapes" as forward-compatible additions; that's
+the direction this composite would go.
 
 **Journal / append-only log** — durability concerns push this out
 of pure SHM territory. A real journal needs WAL semantics, log
@@ -140,7 +140,7 @@ Principal axes: lossiness × reader topology × payload shape.
 |---|---|---|---|---|
 | 1 | Lossy | 1 | Small | Future (likely Ring mode flag if demanded) |
 | 2 | Lossy | N (broadcast) | Small/medium | **Ring** ✓ |
-| 3 | Non-lossy | 1 (queue) | Small/medium | **Channel** (Stage 4c) |
+| 3 | Non-lossy | 1 (queue) | Small/medium | **Channel** ✓ |
 | 4 | Non-lossy | N (broadcast) | Small/medium | Out of scope (usually disk-backed) |
 | 5 | Non-lossy | 1 or N | Large blob | **Pool** ✓ |
 | 6 | Lossy | N | Large blob | Future (very niche) |

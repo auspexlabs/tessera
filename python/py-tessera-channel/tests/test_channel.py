@@ -357,11 +357,11 @@ def test_serial_multiple_producers_simulation_via_separate_handles():
     # any cross-thread Python pattern (one thread blocks holding the
     # GIL, another can't acquire it to make progress).
     #
-    # v0.2 will add `unsafe impl Send + Sync for Channel` plus
-    # `py.allow_threads(|| ...)` wrappers on the blocking facade
-    # methods, enabling cross-thread Python MPSC. For now Python
-    # users wanting multi-producer should use `multiprocessing` —
-    # each subprocess gets its own GIL.
+    # The planned thread-safe facade contract is role-specific:
+    # Sender can become concurrently callable, while one Receiver
+    # handle must stay one-caller-at-a-time or be internally serialized.
+    # For now Python users wanting multi-producer should use
+    # `multiprocessing` — each subprocess gets its own GIL.
     #
     # This test exercises the equivalent code path serially: open
     # multiple Sender handles in sequence, interleaved with recvs,

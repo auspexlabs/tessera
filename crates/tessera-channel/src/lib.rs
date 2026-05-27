@@ -1,8 +1,7 @@
 //! Tessera Channel — non-lossy MPSC shared-memory queue.
 //!
-//! See the workspace README for the design summary; the per-section
-//! references in this crate's source point at the upstream side-doc
-//! `mp_tools_open_source_extraction_2026-05-23.md` in the Bayence-Certus repo.
+//! See the workspace README and `docs/concept_landscape.md` for the
+//! design summary.
 //!
 //! Channel fills cell #3 of the lossiness × reader-topology ×
 //! payload-shape matrix (non-lossy multi-producer single-consumer
@@ -11,10 +10,9 @@
 //! See `docs/concept_landscape.md` in the workspace root for the full
 //! matrix view.
 //!
-//! Stage 4c (in progress): public types + region layout land first;
-//! state machine (`Channel::open` / `send` / `try_send` /
-//! `send_timeout` / `recv` / `try_recv`) lands in follow-up commits,
-//! mirroring the Pool / Ring multi-commit cadence.
+//! The public surface is intentionally small: open a [`Channel`] with a
+//! [`ChannelConfig`], then use Sender-role handles to `send` and the
+//! single Receiver-role handle to `recv`.
 
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -91,4 +89,3 @@ pub struct ChannelConfig {
     /// live Receiver exists. Ignored when `role == Sender`.
     pub force_recreate: bool,
 }
-

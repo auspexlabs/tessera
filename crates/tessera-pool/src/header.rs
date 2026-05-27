@@ -13,10 +13,10 @@
 //! can be reinterpreted out of the mapped memory without copy.
 //!
 //! Numeric fields are stored in native byte order. Tessera Pool is a
-//! single-machine IPC primitive (the IPC namespace boundary is the trust
-//! boundary per §3.5.e); we do not target cross-architecture
-//! deployments. If that changes, bump `FORMAT_VERSION` and add
-//! explicit `to_le_bytes` / `from_le_bytes` plumbing.
+//! single-machine IPC primitive; the IPC namespace boundary is the trust
+//! boundary. We do not target cross-architecture deployments. If that
+//! changes, bump `FORMAT_VERSION` and add explicit `to_le_bytes` /
+//! `from_le_bytes` plumbing.
 
 use bytemuck::{Pod, Zeroable};
 
@@ -36,7 +36,7 @@ pub const FORMAT_VERSION: u32 = 1;
 pub mod flags {
     /// Slot currently leased (between acquire and release/reclaim).
     pub const IN_USE: u32 = 1 << 0;
-    /// `Pool::write` has been called on this lease (one-shot per §3.4 lock).
+    /// `Pool::write` has been called on this lease (one-shot).
     pub const PAYLOAD_FINALIZED: u32 = 1 << 1;
 }
 
@@ -57,7 +57,7 @@ pub struct Header {
     pub _pad0: u32,
     /// Owner-stamped deployment epoch (microseconds since UNIX epoch at
     /// region creation). Used to reject reattach-after-reboot scenarios
-    /// where the owner has been restarted from a fresh deployment (§3.5.b).
+    /// where the owner has been restarted from a fresh deployment.
     pub epoch_micros: u64,
     /// Number of slots in the region. Fixed at creation.
     pub slot_count: u32,
@@ -65,7 +65,7 @@ pub struct Header {
     pub slot_size_bytes: u32,
     /// Time-to-live for in-flight leases, in microseconds. Owner stamps
     /// this at creation; non-owner attachers inherit it from the header
-    /// and cannot override locally (§3.5.d).
+    /// and cannot override locally.
     pub ttl_micros: u64,
     /// BLAKE3(description) digest at region creation. Attachers
     /// recompute from their description and verify the match — catches
@@ -86,7 +86,7 @@ impl Header {
 /// Per-slot metadata. One entry per slot, packed after the header.
 ///
 /// Lives in SHM so cross-container attachers can observe lease state
-/// (validation only — only the owner mutates per §3.5.c single-writer-lease).
+/// (validation only — only the owner mutates).
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable, Debug)]
 pub struct SlotMeta {

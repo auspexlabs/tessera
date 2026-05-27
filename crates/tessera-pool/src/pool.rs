@@ -1,9 +1,8 @@
 //! Pool state machine.
 //!
 //! All owner-side mutations to the SHM slot table flow through here.
-//! Per §3.5.c single-writer-lease, only the owner Pool acquires /
-//! writes / releases / renews; attachers may only read payloads via
-//! a descriptor.
+//! Only the owner Pool acquires, writes, releases, renews, and reclaims;
+//! attachers may only read payloads via a descriptor.
 
 use std::time::{Duration, Instant};
 
@@ -33,7 +32,7 @@ pub struct PoolConfig {
     /// Lease TTL in microseconds. Owner-only; non-owners inherit the
     /// owner-stamped value from the header at attach time.
     pub ttl_micros: u64,
-    /// Owner-side recovery escape hatch (§3.5.b). Default `false`.
+    /// Owner-side recovery escape hatch. Default `false`.
     ///
     /// When `false` (default), an owner that finds the SHM region
     /// already exists on `Pool::new` refuses to clobber it — we
@@ -76,7 +75,7 @@ pub struct Pool {
     region: Region,
     owner_state: Option<OwnerState>,
     /// Cached TTL — for owners, copied from PoolConfig; for attachers,
-    /// inherited from the SHM header per §3.5.d.
+    /// inherited from the SHM header.
     ttl_micros: u64,
 }
 
@@ -161,7 +160,7 @@ impl Pool {
     /// availability; polls the lock-free queue every 5 ms.
     ///
     /// On success, the slot is marked IN_USE with a fresh 128-bit
-    /// lease_id and a bumped generation counter (§3.5.d).
+    /// lease_id and a bumped generation counter.
     pub fn acquire(&mut self, timeout: Duration) -> Result<Lease> {
         let state = self
             .owner_state
@@ -203,7 +202,7 @@ impl Pool {
     /// Write a payload into the leased slot and return a descriptor
     /// the owner can hand across IPC to a worker.
     ///
-    /// v0.1 is one-shot per §3.4: a second `write` on the same lease
+    /// v0.1 is one-shot: a second `write` on the same lease
     /// fails with `WriteAfterFinalize`.
     pub fn write(&mut self, lease: &Lease, payload: &[u8]) -> Result<Descriptor> {
         let state = self
@@ -317,8 +316,7 @@ impl Pool {
     }
 
     /// Renew a lease's `acquired_at` so the next reclaim sweep doesn't
-    /// reclaim it. Owner-side only — workers cannot renew via descriptor
-    /// per §3.5.c single-writer-lease lock.
+    /// reclaim it. Owner-side only — workers cannot renew via descriptor.
     pub fn renew(&mut self, lease: &Lease) -> Result<()> {
         let state = self
             .owner_state
@@ -337,7 +335,7 @@ impl Pool {
     ///
     /// Generation is bumped on each reclaimed slot, so any in-flight
     /// descriptor against that slot will fail `validate_descriptor`
-    /// before it can read stale bytes (§3.5.d).
+    /// before it can read stale bytes.
     pub fn reclaim_stale(&mut self) -> Result<u32> {
         let state = self
             .owner_state

@@ -12,11 +12,12 @@ this at the end by checking that every (sender_id, sequence) pair
 shows up exactly once in the receiver's drained set.
 
 Why subprocesses (not threads): the Python `Channel` class is
-currently `unsendable` (Rust `Channel` is `!Send`) and blocking
-`send()` / `recv()` calls hold the GIL while spinning. Cross-thread
-MPSC via `threading.Thread` would deadlock. Subprocesses sidestep
-this — each has its own GIL. v0.2 plans to add `unsafe impl Send`
-+ `py.allow_threads(|| ...)` so cross-thread Python MPSC works too.
+currently `unsendable` and blocking `send()` / `recv()` calls hold
+the GIL while spinning. Cross-thread MPSC via `threading.Thread`
+would deadlock. Subprocesses sidestep this because each has its own
+GIL. The planned thread-safe contract is role-specific: Sender can
+become concurrently callable, while one Receiver handle must stay
+one-caller-at-a-time or be internally serialized.
 
 Run from the workspace root:
     python examples/channel_mpsc.py

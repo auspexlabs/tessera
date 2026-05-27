@@ -5,7 +5,7 @@
 //! - `tessera_sink.TesseraSinkError` — base Python exception.
 //!
 //! The facade owns ergonomics only — chunking, serialization, hashing,
-//! atomic write all live in the Rust core (§3.4 lock). The caller hands
+//! and atomic writes all live in the Rust core. The caller hands
 //! `submit` pre-serialized `bytes`; the library never picks an encoding.
 //!
 //! ## v0.1 limitation (GIL)

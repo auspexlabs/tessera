@@ -1,10 +1,10 @@
 //! Namespace identification — BLAKE3-derived region handle.
 //!
-//! Per §3.5.a, the public surface uses a human-readable `description`
-//! string; internally, the library hashes it with BLAKE3 to derive a
-//! stable, deterministic handle. Two peers with the same description
-//! derive the same handle and attach to the same SHM region with no
-//! manual coordination.
+//! The public surface uses a human-readable `description` string;
+//! internally, the library hashes it with BLAKE3 to derive a stable,
+//! deterministic handle. Two peers with the same description derive
+//! the same handle and attach to the same SHM region with no manual
+//! coordination.
 //!
 //! The POSIX SHM segment name is `/tessera-pool-<32 hex chars>` (the
 //! first 128 bits of the BLAKE3 digest), which fits in NAME_MAX with

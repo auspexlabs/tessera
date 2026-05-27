@@ -44,7 +44,7 @@ pub enum TesseraPoolError {
     },
 
     /// Non-owner attempted an owner-only operation (`acquire`, `release`,
-    /// `renew`, `reclaim_stale`). Per §3.5.c single-writer-lease.
+    /// `renew`, `reclaim_stale`).
     #[error("operation requires owner-side Pool (constructed with is_owner=true)")]
     OwnerOnly,
 
@@ -74,7 +74,7 @@ pub enum TesseraPoolError {
     },
 
     /// `Pool::write` was called twice on the same lease. v0.1 is
-    /// one-shot per §3.4 lock — acquire, write once, release.
+    /// one-shot — acquire, write once, release.
     #[error("write_after_finalize: Pool::write already called on lease for slot {slot_index} (v0.1 one-shot)")]
     WriteAfterFinalize {
         /// Slot index that was already finalized.

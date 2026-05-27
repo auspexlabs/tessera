@@ -1,8 +1,7 @@
 //! Tessera Ring — lossy mmap-backed multi-writer / multi-reader ring buffer.
 //!
-//! See the workspace README for the design summary; the per-section
-//! references in this crate's source point at the upstream side-doc
-//! `mp_tools_open_source_extraction_2026-05-23.md`.
+//! See the workspace README and `docs/concept_landscape.md` for the
+//! design summary.
 //!
 //! The public surface is small: open a `Ring` from a `RingConfig`,
 //! issue `Writer` and `Reader` handles, and exchange `Event`s. The
@@ -25,11 +24,10 @@ pub use ring::{Event, Reader, ReaderStats, Ring, RingConfig, Writer};
 
 /// Per-section configuration supplied by the caller at `Ring::open`.
 ///
-/// Sections are caller-named logical streams inside a single Ring
-/// region: a `logs` section and a `metrics` section can coexist with
-/// independent slot counts and slot sizes. The library does not
-/// inspect or classify event bytes — the caller addresses sections by
-/// id at every `publish` / `poll` call.
+/// Sections are caller-defined logical streams inside a single Ring
+/// region. Callers map names such as `logs` or `metrics` to integer
+/// `section_id` values; the library only stores and routes by id.
+/// Sections can have independent slot counts and slot sizes.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct SectionConfig {
     section_id: u32,

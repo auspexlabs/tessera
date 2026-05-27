@@ -6,10 +6,9 @@
 //! advance `head`) drains in order. Non-lossy: senders never
 //! overwrite a slot the receiver hasn't dequeued.
 //!
-//! Per side-doc §4c pseudocode. Linearizability comes from the
-//! head/tail discipline + per-slot `sequence` cross-check; no
-//! seqlock retry on the read side because only one Receiver
-//! consumes.
+//! Linearizability comes from the head/tail discipline plus per-slot
+//! `sequence` cross-check; no seqlock retry is needed on the read side
+//! because only one Receiver consumes.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;

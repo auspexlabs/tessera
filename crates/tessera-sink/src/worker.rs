@@ -117,7 +117,7 @@ pub fn run_worker(params: WorkerParams) -> Result<()> {
     // Startup handshake: announce readiness only after the control
     // region exists (created + bound above). The owner waits for this
     // before attaching its control Sender, so it can never bind to a
-    // stale control region from a crashed predecessor (§ Codex PR #10).
+    // stale control region from a crashed predecessor.
     send_ack(&ack, &AckMessage::WorkerReady {
         worker_id: params.worker_id,
     })?;

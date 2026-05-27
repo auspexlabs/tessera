@@ -18,10 +18,10 @@
 //! without copy.
 //!
 //! Numeric fields are stored in native byte order. Channel is a
-//! single-machine IPC primitive (the IPC namespace boundary is the
-//! trust boundary per §3.5.e); we do not target cross-architecture
-//! deployments. If that changes, bump `FORMAT_VERSION` and add
-//! explicit `to_le_bytes` / `from_le_bytes` plumbing.
+//! single-machine IPC primitive; the IPC namespace boundary is the trust
+//! boundary. We do not target cross-architecture deployments. If that
+//! changes, bump `FORMAT_VERSION` and add explicit `to_le_bytes` /
+//! `from_le_bytes` plumbing.
 
 use bytemuck::{Pod, Zeroable};
 
@@ -62,7 +62,7 @@ pub struct Header {
     /// Receiver-stamped deployment epoch (microseconds since UNIX
     /// epoch at region creation). Used to reject reattach-after-
     /// reboot scenarios where the Receiver has been restarted from
-    /// a fresh deployment (§3.5.b).
+    /// a fresh deployment.
     pub epoch_micros: u64,
     /// Number of slots in the region. Fixed at creation.
     pub slot_count: u32,

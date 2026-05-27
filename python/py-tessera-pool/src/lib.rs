@@ -7,7 +7,7 @@
 //! - `tessera_pool.TesseraPoolError` — base Python exception.
 //!
 //! The facade owns ergonomics only — every data operation delegates
-//! to the Rust core. No serialization happens in Python (§3.4 lock).
+//! to the Rust core. No serialization happens in Python.
 
 use std::time::Duration;
 
@@ -385,7 +385,7 @@ impl PyPool {
     ) -> PyResult<PyDescriptor> {
         // v0.1: hold the GIL through the copy. The bytes are slot-bounded
         // (configurable per pool) so worst-case latency is bounded.
-        // Future: `py.allow_threads(...)` after pulling out an owned
+        // Later: `py.allow_threads(...)` after pulling out an owned
         // payload bytes Vec; needs care around the Send bound on the
         // captured mutex guard.
         let bytes = payload.as_bytes();

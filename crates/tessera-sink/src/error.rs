@@ -4,9 +4,9 @@ use thiserror::Error;
 
 /// All Sink errors flow through this enum.
 ///
-/// Sink is a *composite service* over Pool (zero-copy payload handoff)
-/// and two Channels (control + ack planes), so its error surface wraps
-/// both underlying primitives via `#[from]` and adds the
+/// Sink is a *composite service* over Pool (shared-memory payload
+/// handoff) and two Channels (control + ack planes), so its error
+/// surface wraps both underlying primitives via `#[from]` and adds the
 /// service-specific failure modes (worker spawn, chunk integrity,
 /// job lifecycle).
 #[derive(Error, Debug)]

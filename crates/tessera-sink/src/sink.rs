@@ -7,9 +7,6 @@
 //! milliseconds, so leases are released almost immediately; the renewal
 //! timer is the safety net for in-flight chunks, and the Pool TTL plus
 //! worker orphan-detection bound the worst case.
-//!
-//! See §4d of the upstream side-doc for the handoff protocol this
-//! implements.
 
 use std::collections::HashMap;
 use std::process::Child;

@@ -4,8 +4,8 @@
 //! its own SHM wire format. Instead it wires together the three
 //! primitives —
 //!
-//! - [`tessera_pool::Pool`] for zero-copy payload handoff (payloads
-//!   larger than one slot are split into chunks),
+//! - [`tessera_pool::Pool`] for shared-memory payload handoff
+//!   (payloads larger than one slot are split into chunks),
 //! - one [`tessera_channel::Channel`] per worker as the **control
 //!   plane** (owner → worker `ChunkDescriptor` / `Commit` / `Cancel`),
 //! - one shared [`tessera_channel::Channel`] as the **ack plane**
@@ -17,10 +17,7 @@
 //! verification.
 //!
 //! See the workspace README and `docs/concept_landscape.md` for where
-//! Sink sits relative to the primitives; the design is specified in
-//! the upstream side-doc `mp_tools_open_source_extraction_2026-05-23.md`
-//! (§3.4 Rust-from-start, §3.5 cross-process SHM, §4d handoff
-//! pseudocode) in the Bayence-Certus repo.
+//! Sink sits relative to the primitives.
 //!
 //! ## Region ownership
 //!
@@ -34,9 +31,9 @@
 //! | control channel i | worker i | worker i (Receiver)      |
 //! | pool              | workers  | owner (lease authority)  |
 //!
-//! The Pool is the one exception: its owner is the single writer
-//! (§3.5.c single-writer-lease), not a reader — workers attach and
-//! read payloads via descriptors handed across the control channel.
+//! The Pool is the one exception: its owner is the single writer, not a
+//! reader. Workers attach and read payloads via descriptors handed
+//! across the control channel.
 //!
 //! The owner ([`Sink`]) is single-threaded by necessity (Pool/Channel
 //! wrap a `!Send` `Shmem`): it cooperatively drains the ack plane and

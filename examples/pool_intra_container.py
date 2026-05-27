@@ -7,7 +7,7 @@ channel, and the worker reads the payload bytes from shared memory
 (no copy through pickle of the payload itself; only the small
 Descriptor crosses the queue).
 
-Important pattern note (§3.5.d "owner-held lease"):
+Important pattern note ("owner-held lease"):
 The owner MUST NOT release a lease until the worker has finished
 reading the descriptor's payload. Releasing the lease frees the slot;
 a subsequent `acquire` bumps the slot's generation, which invalidates

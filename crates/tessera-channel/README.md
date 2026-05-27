@@ -4,9 +4,8 @@ Non-lossy MPSC (multi-producer, single-consumer) shared-memory queue.
 Credit-based backpressure (block / try / timeout), FIFO ordering,
 caller-selected send mode per call.
 
-**Status**: v0.0.1 — Rust core + PyO3 facade functional. CI wiring
-+ crates.io / PyPI publish land in Stage 5 of the upstream extraction
-plan.
+**Status**: v0.0.1. Rust core and PyO3 facade are functional; the
+crate is still pre-v0.1 and not yet published.
 
 ## What it does
 
@@ -23,15 +22,14 @@ plan.
   fast with `ChannelFull`; `send_timeout()` is bounded blocking.
   Writers never overwrite — that's Ring's job (cell #2 of the
   primitive matrix); Channel is cell #3 (non-lossy MPSC small
-  typed-bytes).
+  byte payloads).
 - **BLAKE3-derived namespace** — same convention as Pool / Ring.
   Two peers with the same `description` derive the same SHM region
   name and attach without manual coordination.
 - **Single-owner lifecycle** — one process creates the region
-  (Receiver role); producers attach as Sender role. Mirrors §3.5.b
-  of the upstream extraction plan.
-- **Trusted IPC posture** — same as Pool / Ring (§3.5.e): the IPC
-  namespace boundary IS the trust boundary; no in-library ACLs.
+  (Receiver role); producers attach as Sender role.
+- **Trusted IPC posture** — the IPC namespace boundary is the trust
+  boundary; Tessera does not implement in-library ACLs.
 
 ## Quick start
 
@@ -46,7 +44,7 @@ let receiver = Channel::open(ChannelConfig {
     force_recreate: false,
 })?;
 
-// In another process (or thread, attached to the same region):
+// In another process, or another Sender handle attached to the same region:
 let sender = Channel::open(ChannelConfig {
     description: "my-app/control".into(),
     slot_count: 256,
@@ -63,6 +61,19 @@ let msg = receiver.recv()?;
 For Python ergonomics, install the
 [`tessera-channel`](../../python/py-tessera-channel/) Python facade and
 use `from tessera_channel import Channel` with the same API.
+
+## Threading contract
+
+The wire protocol is MPSC: multiple Sender handles may publish
+concurrently and one Receiver handle drains the queue. The current Rust
+types are not exposed as a general in-process `Send`/`Sync` API because
+the mmap owner is not thread-safe by default, and the Python facade is
+currently `unsendable`.
+
+The intended v0.1+ contract is role-specific: Sender can become
+concurrently callable, while a single Receiver handle must remain
+one-caller-at-a-time or be internally serialized. See
+[`docs/issue_facade_thread_safety.md`](../../docs/issue_facade_thread_safety.md).
 
 ## Tests
 
@@ -102,8 +113,9 @@ lossiness × reader-topology × payload-shape matrix; see
 
 ## Roadmap
 
-- **v0.1.0 (Stage 5)**: publish to crates.io with the current public
-  surface (MPSC, bytes-only payloads, three send modes).
+- **v0.1.0**: publish to crates.io with the current public surface
+  (MPSC, bytes-only payloads, three send modes) once the thread-safety
+  contract and packaging are locked.
 - **Future**:
   - MPMC variant (multiple consumers) once a real use case surfaces.
   - Typed message support at the facade layer (serialize via

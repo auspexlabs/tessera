@@ -19,21 +19,17 @@
 //! can be reinterpreted out of the mapped memory without copy.
 //!
 //! Numeric fields are stored in native byte order. Tessera Ring is a
-//! single-machine IPC primitive (the IPC namespace boundary is the trust
-//! boundary per §3.5.e of the upstream extraction plan); we do not
-//! target cross-architecture deployments. If that changes, bump
-//! `FORMAT_VERSION` and add explicit `to_le_bytes` / `from_le_bytes`
-//! plumbing.
+//! single-machine IPC primitive; the IPC namespace boundary is the
+//! trust boundary. We do not target cross-architecture deployments. If
+//! that changes, bump `FORMAT_VERSION` and add explicit `to_le_bytes` /
+//! `from_le_bytes` plumbing.
 //!
 //! ### Seqlock model
 //!
-//! Tessera Ring uses **per-slot seqlocks** as locked by §4b of the
-//! extraction plan. Each `SlotHeader` carries its own `sequence`
-//! counter; writers stamp odd-then-even to publish; readers spin until
-//! they see the same even sequence before and after copy. The Bayence
-//! reference (`fast_tui/src/log_reader.rs`) uses a per-section seqlock
-//! instead — coarser-grained, simpler to write, more retries under
-//! contention. Per-slot is strictly the v0.1 design.
+//! Tessera Ring uses **per-slot seqlocks**. Each `SlotHeader` carries
+//! its own `sequence` counter; writers stamp odd-then-even to publish;
+//! readers spin until they see the same even sequence before and after
+//! copy.
 
 use bytemuck::{Pod, Zeroable};
 
@@ -131,7 +127,7 @@ impl SectionHeader {
 
 /// Per-slot header. Precedes each slot's payload bytes.
 ///
-/// Per-slot seqlock per §4b: writers stamp `sequence` odd before
+/// Per-slot seqlock: writers stamp `sequence` odd before
 /// modifying payload, then even after — readers spin until they see
 /// the same even sequence before-and-after their copy. `position`
 /// carries the global writer position at write time so readers can

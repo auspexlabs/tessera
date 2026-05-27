@@ -1,8 +1,7 @@
 //! Tessera Ring state machine — Writer::publish + Reader::poll.
 //!
 //! Sits on top of `crate::region`'s atomic + raw-pointer accessors and
-//! implements the seqlock protocol locked in §4b of the upstream
-//! extraction plan:
+//! implements the per-slot seqlock protocol:
 //!
 //! ```text
 //! Writer::publish(section_id, bytes):
@@ -84,9 +83,8 @@ pub struct RingConfig {
     /// Caller-supplied section list.
     pub sections: Vec<SectionConfig>,
     /// `true` → caller is the creator (will `create()`); `false` →
-    /// caller is an attacher (will `open()`). Single-creator semantics
-    /// per §3.5.b: exactly one process creates the region; others
-    /// attach.
+    /// caller is an attacher (will `open()`). Single-creator semantics:
+    /// exactly one process creates the region; others attach.
     pub is_owner: bool,
     /// Operator-asserted recovery: if `is_owner` is true and the SHM
     /// segment already exists, unlink + recreate unconditionally.
@@ -147,8 +145,8 @@ impl Ring {
     }
 
     /// Issue a new `Reader` handle for a specific section, starting
-    /// at the current writer position (fresh-reader-starts-at-now per
-    /// §4b — historical replay from buffered slots is deferred).
+    /// at the current writer position. Historical replay from buffered
+    /// slots is deferred.
     pub fn reader(&self, section_id: u32) -> Result<Reader> {
         let ordinal = self.region.section_ordinal(section_id)?;
         let cursor = self
@@ -341,8 +339,7 @@ pub struct Event {
 }
 
 /// Per-section reader handle. Maintains a process-local cursor and a
-/// drop counter; multiple Readers on the same section are independent
-/// (multi-reader broadcast per §4.1).
+/// drop counter; multiple Readers on the same section are independent.
 #[derive(Clone)]
 pub struct Reader {
     region: Arc<Region>,
@@ -601,7 +598,7 @@ mod tests {
 
     #[test]
     fn fresh_reader_starts_at_current_writer_position() {
-        // §4b: fresh readers see only NEW events, not historical
+        // Fresh readers see only NEW events, not historical
         // ring contents.
         let cfg = RingConfig {
             description: unique_description("fresh-reader-now"),
@@ -631,7 +628,7 @@ mod tests {
 
     #[test]
     fn multiple_readers_each_see_full_stream() {
-        // §4.1: multi-reader broadcast — each reader maintains its
+        // Multi-reader broadcast: each reader maintains its
         // own cursor.
         let cfg = RingConfig {
             description: unique_description("multi-reader"),

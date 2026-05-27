@@ -10,4 +10,5 @@ loop. You normally never invoke this by hand — the owner discovers and
 spawns it (config path → `TESSERA_SINK_WORKER_BIN` → sibling-of-exe →
 `PATH`).
 
-**Status**: v0.0.1, Stage 4d.
+**Status:** v0.0.1. Functional in development builds; not yet
+published.

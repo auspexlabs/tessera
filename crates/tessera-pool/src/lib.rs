@@ -1,12 +1,9 @@
 //! Tessera Pool — non-lossy lease-backed shared-memory pool primitive.
 //!
-//! See the workspace README for the design summary; the per-section
-//! references in this crate's source point at the upstream side-doc
-//! `mp_tools_open_source_extraction_2026-05-23.md`.
-//!
-//! Stage 4a (in progress): public types + region layout land first;
-//! state machine (`acquire` / `write` / `release` / `reclaim_stale` /
-//! `renew`) lands in follow-up commits.
+//! See the workspace README and `docs/concept_landscape.md` for the
+//! design summary. Pool is the non-lossy large-payload handoff
+//! primitive: one owner acquires, writes, releases, renews, and reclaims
+//! fixed-size slots; attachers read owned byte copies by descriptor.
 
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -115,7 +112,7 @@ impl Lease {
 ///
 /// Carries the same identifying fields as `Lease` but does NOT entitle
 /// the holder to release or renew — those operations stay with the
-/// owner per §3.5.c single-writer-lease lock. A worker validates a
+/// owner by the single-writer-lease contract. A worker validates a
 /// descriptor by attaching to the region, looking up `slot_index`'s
 /// metadata, and confirming `(lease_id, generation)` still match.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -157,4 +154,3 @@ impl Descriptor {
         self.size_bytes
     }
 }
-

@@ -144,7 +144,7 @@ def test_reader_lapped_accounts_dropped_events():
 
 
 def test_fresh_reader_starts_at_current_writer_position():
-    # §4b: fresh readers see only NEW events, not historical ring contents.
+    # Fresh readers see only NEW events, not historical ring contents.
     desc = _unique_description("fresh-reader-now")
     with Ring(description=desc, sections=[(0, 8, 16)]) as ring:
         w = ring.writer()
@@ -164,7 +164,7 @@ def test_fresh_reader_starts_at_current_writer_position():
 
 
 def test_multiple_readers_each_see_full_stream():
-    # §4.1: multi-reader broadcast — each reader maintains its own cursor.
+    # Multi-reader broadcast: each reader maintains its own cursor.
     desc = _unique_description("broadcast")
     with Ring(description=desc, sections=[(0, 16, 16)]) as ring:
         w = ring.writer()

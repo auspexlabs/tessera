@@ -189,7 +189,7 @@ impl Region {
     }
 
     /// TTL read from the region header. Non-owners use this to
-    /// inherit the owner-stamped TTL (§3.5.d).
+    /// inherit the owner-stamped TTL.
     pub fn ttl_micros(&self) -> u64 {
         self.read_header().ttl_micros
     }

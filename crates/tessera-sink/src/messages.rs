@@ -1,9 +1,8 @@
 //! Control- and ack-plane message types and their wire codec.
 //!
 //! These messages travel across [`tessera_channel::Channel`] as raw
-//! bytes. Per §3.4, serialization lives in Rust (never the Python
-//! facade), so the codec here is the single source of truth for the
-//! over-the-wire shape.
+//! bytes. Serialization lives in Rust (never the Python facade), so the
+//! codec here is the single source of truth for the over-the-wire shape.
 //!
 //! ## Wire format
 //!

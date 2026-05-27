@@ -3,11 +3,13 @@
 Python facade for [`tessera-channel`](../../crates/tessera-channel/) —
 non-lossy MPSC shared-memory queue.
 
-**Status**: v0.0.1 — functional. CI / PyPI publish lands in Stage 5.
+**Status**: v0.0.1. Functional in development builds; not yet
+published to PyPI.
 
 ## Install (development)
 
 ```bash
+cd python/py-tessera-channel
 maturin develop --release   # builds the native extension into the active venv
 ```
 
@@ -68,8 +70,9 @@ MPSC-safe (validated by the `concurrent_multiple_producers_…` test
 in the Rust crate); the limitation is purely at the Python facade
 layer.
 
-For v0.1, Python users wanting multi-producer should use
-`multiprocessing.Process` — each subprocess has its own GIL. v0.2
-plans to add `unsafe impl Send + Sync for Channel` plus
-`py.allow_threads(|| ...)` wrappers on the blocking facade methods
-to enable cross-thread Python MPSC.
+For now, Python users wanting multi-producer should use
+`multiprocessing.Process` — each subprocess has its own GIL. The planned
+thread-safe contract is role-specific: Sender can become concurrently
+callable, while a single Receiver handle must stay one-caller-at-a-time
+or be internally serialized. The design is tracked in
+[`docs/issue_facade_thread_safety.md`](../../docs/issue_facade_thread_safety.md).
