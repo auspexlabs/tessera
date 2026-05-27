@@ -64,10 +64,18 @@ the caller intentionally owns cleanup of a stale region.
 - `close()` — releases the facade's handle.
 - `TesseraPoolError` — base exception class.
 
-## Threading Limitation
+## Threading
 
-The Python class is currently `unsendable`; use a Pool object from the
-thread that created it. Cross-process sharing is supported, and each
-process should open its own Pool handle. The cross-thread facade contract
-is tracked in
+`Pool` is `Send + Sync` — a handle may be moved between threads and used
+concurrently. `acquire`/`write`/`release`/`renew`/`reclaim_stale` and the
+`read_payload` read path are serialized per slot internally; blocking
+`acquire` releases the GIL and holds no lock across its wait, so a
+blocked `acquire` never prevents a `release` on another thread, and
+`close()` wakes a blocked `acquire`.
+
+`read_payload` is correct-or-`TesseraPoolError` (`StaleHandle`) under the
+single-writer-lease protocol (owner holds the lease until the reader has
+consumed the payload; reclaim is crash-recovery only). A fully race-free
+copy under a *protocol violation* — rewriting a slot in one process while
+another reads it cross-process — is a v0.2 item. See
 [`docs/issue_facade_thread_safety.md`](../../docs/issue_facade_thread_safety.md).

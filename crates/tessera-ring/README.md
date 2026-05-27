@@ -59,17 +59,18 @@ For Python ergonomics, install the
 
 ## Threading Contract
 
-The ring protocol supports multiple Writer handles and independent
-Reader handles over the same SHM region. The current Rust types are not
-published as a general in-process `Send`/`Sync` API because the mmap
-owner is not thread-safe by default, and the Python facade is currently
-`unsendable`.
+Ring is `Send + Sync` (the seqlock protocol is concurrent by design), so
+handles move between threads and the facade is no longer `unsendable`.
+The contract is role-specific:
 
-The intended contract is role-specific: Writer can become concurrently
-callable, while a single Reader handle owns a local cursor and must stay
-one-caller-at-a-time or be internally serialized. Independent readers
-remain independent. See
-[`docs/issue_facade_thread_safety.md`](../../docs/issue_facade_thread_safety.md).
+- **Writer** is concurrently callable — multiple Writer handles, on
+  multiple threads or processes, publish via the seqlock without external
+  locking.
+- **Reader** keeps a process-local cursor and `poll(&mut self)`, so a
+  single Reader handle is one-caller-at-a-time (the facade serializes it
+  internally). Independent Reader handles remain independent.
+
+See [`docs/issue_facade_thread_safety.md`](../../docs/issue_facade_thread_safety.md).
 
 ## Tests
 

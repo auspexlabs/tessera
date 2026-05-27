@@ -43,19 +43,34 @@ byte-level primitives:
 Each Rust crate is usable directly from Rust. Each Python package in
 [`python/`](python/) exposes the same core capability through PyO3.
 
-## Current Concurrency Contract
+## Concurrency Contract
 
-The current Python facades are `#[pyclass(unsendable)]`, so Python objects are
-thread-affine and PyO3 raises if a facade instance is touched from a different
-OS thread. Cross-process use is supported and covered by examples; cross-thread
-Python use is under active design before v0.1.
+The primitives are thread-safe per role. `Send` (move a handle between
+threads) is separated from `Sync` (call the same handle concurrently):
 
-The intended contract is tracked in
-[`docs/issue_facade_thread_safety.md`](docs/issue_facade_thread_safety.md):
-separate `Send` (move a handle between threads) from `Sync` (concurrent calls
-on the same handle), make soundness claims at the Rust-core protocol boundary,
-and ensure blocking Python methods release the GIL without holding lifecycle
-locks that other threads need for progress.
+| Primitive · role | Send | Sync (concurrent on one handle) |
+|---|---|---|
+| Pool owner / attacher | ✓ | ✓ — per-slot locks; read path included |
+| Channel sender | ✓ | ✓ — CAS-MPSC |
+| Channel receiver | ✓ | serialized (one dequeue at a time) |
+| Ring writer | ✓ | ✓ — seqlock multi-writer |
+| Ring reader | ✓ | serialized (one `poll` per reader handle) |
+| Sink owner | ✓ | thread-affine (drive from one thread) |
+
+Blocking Python methods release the GIL and hold no lifecycle lock across
+the wait, so e.g. a blocked `Pool.acquire` never prevents a `release` on
+another thread; `close()` wakes a blocked op with a clean error. Soundness
+is justified at each Rust core's protocol boundary (per-slot locks, CAS,
+seqlock). Cross-process use is supported and covered by the examples.
+
+**One documented limitation, deferred to v0.2.** `Pool::read_payload` is
+correct-or-`StaleHandle` under the single-writer-lease protocol (the owner
+holds the lease until the reader acks; reclaim is crash-recovery only). It
+does not yet make a payload copy race-free if a caller violates that
+protocol by rewriting a slot in one process while another reads it
+cross-process — that needs an in-SHM robust per-slot lock, tracked for
+v0.2. v0.1 is parity-plus with the in-tree pool it replaces. Full
+rationale: [`docs/issue_facade_thread_safety.md`](docs/issue_facade_thread_safety.md).
 
 ## Quick Start
 

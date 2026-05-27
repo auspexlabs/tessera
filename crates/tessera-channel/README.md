@@ -64,16 +64,20 @@ use `from tessera_channel import Channel` with the same API.
 
 ## Threading contract
 
-The wire protocol is MPSC: multiple Sender handles may publish
-concurrently and one Receiver handle drains the queue. The current Rust
-types are not exposed as a general in-process `Send`/`Sync` API because
-the mmap owner is not thread-safe by default, and the Python facade is
-currently `unsendable`.
+Channel is `Send + Sync`, so handles move between threads and the facade
+is no longer `unsendable`. The contract is role-specific:
 
-The intended v0.1+ contract is role-specific: Sender can become
-concurrently callable, while a single Receiver handle must remain
-one-caller-at-a-time or be internally serialized. See
-[`docs/issue_facade_thread_safety.md`](../../docs/issue_facade_thread_safety.md).
+- **Sender** is concurrently callable — multiple Sender handles, on
+  multiple threads or processes, publish via the CAS-MPSC protocol
+  without external locking.
+- **Receiver** is single-consumer: the dequeue is serialized by an
+  internal `recv_lock`, so concurrent `recv` on the same/cloned receiver
+  is safe (one at a time). `try_recv` stays non-blocking (returns
+  `ChannelEmpty` rather than block behind an active `recv`), and
+  `recv_timeout`'s deadline bounds the total wait including lock
+  contention.
+
+See [`docs/issue_facade_thread_safety.md`](../../docs/issue_facade_thread_safety.md).
 
 ## Tests
 

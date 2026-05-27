@@ -59,20 +59,21 @@ N-producer single-consumer pattern.
   - `close()` / `__enter__` / `__exit__`
 - `TesseraChannelError` — base exception class.
 
-## v0.1 limitation: cross-thread Python use
+## Threading
 
-The Python `Channel` class is currently `unsendable` (Rust `Channel`
-is `!Send` due to `Shmem`'s `!Send`), and blocking `send()` / `recv()`
-calls spin inside Rust while holding the GIL. As a result, doing
-cross-thread MPSC via `threading.Thread` will deadlock (one thread
-blocks holding the GIL, another can't proceed). The Rust core IS
-MPSC-safe (validated by the `concurrent_multiple_producers_…` test
-in the Rust crate); the limitation is purely at the Python facade
-layer.
+`Channel` is `Send + Sync` — handles move between threads and are used
+concurrently. Blocking `send()` / `recv()` release the GIL, so
+cross-thread MPSC via `threading.Thread` works (no deadlock). The
+contract is role-specific:
 
-For now, Python users wanting multi-producer should use
-`multiprocessing.Process` — each subprocess has its own GIL. The planned
-thread-safe contract is role-specific: Sender can become concurrently
-callable, while a single Receiver handle must stay one-caller-at-a-time
-or be internally serialized. The design is tracked in
+- **Sender** is concurrently callable — multiple senders (threads or
+  processes) publish via CAS-MPSC.
+- **Receiver** is single-consumer: the dequeue is serialized by an
+  internal lock, so concurrent `recv()` on a shared/cloned receiver is
+  safe (one at a time). `try_recv()` stays non-blocking, and
+  `recv_timeout()`'s deadline bounds the total wait.
+
+`close()` wakes a blocked `send`/`recv` with a `TesseraChannelError`.
+`multiprocessing.Process` also works (each subprocess opens its own
+handle by description). Design notes:
 [`docs/issue_facade_thread_safety.md`](../../docs/issue_facade_thread_safety.md).

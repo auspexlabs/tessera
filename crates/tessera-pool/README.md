@@ -74,15 +74,32 @@ let bytes = pool.read_payload(&descriptor)?;
 
 ## Threading Contract
 
-The current Rust core inherits `!Send` / `!Sync` constraints from the
-underlying mmap owner, and the Python facade is marked `unsendable`.
-Use one handle from one thread today. Cross-process use is the supported
-sharing model.
+Pool is `Send + Sync`: a handle may be moved between threads and called
+concurrently. `acquire` / `write` / `release` / `renew` / `reclaim_stale`
+and the `read_payload` read path are serialized per slot internally, and
+`acquire` holds no lock across its wait — so a thread blocked in
+`acquire` never prevents a `release` on another thread from freeing a
+slot. The Python facade releases the GIL on the blocking `acquire`, and
+`close()` wakes a blocked `acquire` with a clean error.
 
-The intended cross-thread contract is being designed in
-[`docs/issue_facade_thread_safety.md`](../../docs/issue_facade_thread_safety.md).
-Pool is the hardest case because `acquire`/`release` concurrency and the
-`read_payload` validate-then-copy path both need internal synchronization.
+**How `read_payload` must be used today.** Reads are correct-or-`StaleHandle`
+under Tessera's single-writer-lease protocol: the owner holds the lease
+until the reader has consumed the payload (acked) and only reclaims a
+slot whose reader is gone (crash recovery). Under that protocol a writer
+never mutates a slot with a live reader, so every read either returns the
+correct bytes or fails `StaleHandle`. This is the model the library is
+built for, and it is strictly safer than the in-tree pool it replaces
+(which had no generation check at all).
+
+What v0.1 does **not** yet provide: a fully race-free payload copy if a
+caller *violates* that protocol — reclaiming/reusing and rewriting a slot
+in one process while another process is mid-`read_payload`. The
+generation re-check detects this after the copy (returns `StaleHandle`),
+but the unsynchronized cross-process copy is itself a data race that a
+process-private lock cannot prevent. Making reads race-free under
+*arbitrary* concurrent writer/reader across processes needs an in-SHM
+robust per-slot lock — a **v0.2** item (see
+[`docs/issue_facade_thread_safety.md`](../../docs/issue_facade_thread_safety.md)).
 
 ## Tests
 
@@ -96,8 +113,13 @@ rejection, oversized payloads, and attacher restrictions.
 
 ## Roadmap
 
-- v0.1: publish the current byte-oriented API once the public docs,
-  packaging, and thread-safety contract are locked.
+- v0.1: publish the current byte-oriented API once the public docs and
+  packaging are locked. Thread-safety contract is implemented (Pool is
+  `Send + Sync`; see Threading Contract).
+- v0.2: in-SHM robust per-slot lock so `read_payload` is race-free under
+  *arbitrary* concurrent writer/reader across processes — i.e. beyond the
+  single-writer-lease protocol, for use-cases other than the owner-held
+  lease model Tessera was extracted for.
 - Later candidates: typed slot views, zero-copy borrowed views with
   explicit lifetimes, eviction-aware lease shapes, and peer/multi-owner
   modes if a concrete use case justifies the extra protocol surface.

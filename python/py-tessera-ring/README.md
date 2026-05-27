@@ -52,11 +52,15 @@ for a cross-process owner + subprocess-consumer demo.
   diagnostics.
 - `Event`, `ReaderStats`, `TesseraRingError`.
 
-## Threading Limitation
+## Threading
 
-The Python classes are currently `unsendable`; use each Ring, Writer,
-and Reader object from the thread that created it. Cross-process sharing
-is supported, and each process should open its own handle. The planned
-thread-safe contract is role-specific: Writer can become concurrently
-callable, while one Reader handle must stay one-caller-at-a-time or be
-internally serialized.
+The Ring classes are `Send + Sync` — handles move between threads and the
+facades are no longer `unsendable`. Role-specific:
+
+- **Writer** is concurrently callable (the seqlock is multi-writer by
+  design) — multiple writers across threads or processes.
+- **Reader** keeps a local cursor, so one Reader handle is
+  one-caller-at-a-time (serialized internally by the facade). Independent
+  Reader handles remain independent.
+
+Design notes: [`docs/issue_facade_thread_safety.md`](../../docs/issue_facade_thread_safety.md).
