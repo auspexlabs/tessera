@@ -156,10 +156,16 @@ For complete runnable demos, see [`examples/`](examples/).
 |---|---|
 | Pool Rust core + PyO3 facade | implemented |
 | Ring Rust core + PyO3 facade | implemented |
+| Ring surface consumed by Auspice (cross-language Python↔Rust integration) | validated |
 | Channel Rust core + PyO3 facade | implemented |
 | Sink Rust core + PyO3 facade + `tessera-sink-worker` | implemented |
 | Certus re-import and production validation | next gate |
 | crates.io / PyPI release | deferred until the Certus gate passes |
+
+The `tessera-ring` surface that Auspice consumes (Python writer → Rust reader,
+the log/telemetry plane) has been exercised end-to-end by a cross-language
+integration and is considered stable; the remaining v0.1 gate above concerns
+the broader Certus re-import, not that consumed path.
 
 ## Workspace Layout
 
