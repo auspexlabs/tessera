@@ -8,7 +8,7 @@ version = "0.0.1"
 description = "Non-lossy lease-backed shared-memory pool primitive (Tessera Pool)"
 readme = "README.md"
 license = { text = "MIT OR Apache-2.0" }
-authors = [{ name = "Indubitable Industries" }]
+authors = [{ name = "Auspex Labs" }]
 requires-python = ">=3.10"
 classifiers = [
     "Development Status :: 1 - Planning",

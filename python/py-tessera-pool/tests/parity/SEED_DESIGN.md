@@ -3,9 +3,8 @@
 Deterministic byte-payload seed + a syrupy snapshot pinning Tessera
 Pool's byte-faithful round-trip behavior over time.
 
-Pattern mirrors `tests/unit/tessera_port_baseline/` in
-[`Indubitable-Industries/Bayence-Certus`](https://github.com/Indubitable-Industries/Bayence-Certus):
-small literal seed committed to git, syrupy JSON snapshot committed
+Pattern mirrors the `tessera_port_baseline` unit tests in a downstream
+consumer: small literal seed committed to git, syrupy JSON snapshot committed
 under `__snapshots__/`, regenerate with `pytest --snapshot-update`.
 
 ## Files
@@ -36,16 +35,16 @@ After regeneration, `git diff` shows exactly what changed. A non-empty
 diff that wasn't intended indicates non-determinism that needs to be
 controlled before accepting the new baseline.
 
-## Relationship to the upstream Certus baseline
+## Relationship to the downstream consumer baseline
 
-Certus's `tests/unit/test_tessera_pool_parity.py` pins the *consumer*
-(`ParquetWorkerPool`) output (parquet files, Arrow-IPC-canonical hash).
+The downstream consumer's own pool parity test pins the *consumer*
+(a parquet worker pool) output (parquet files, Arrow-IPC-canonical hash).
 The seed there is Arrow records.
 
 This baseline pins the *primitive* (`tessera_pool.Pool`) output (bytes
 round-trip). The seed here is raw bytes at edge sizes.
 
-The two baselines test complementary contracts. When the Certus
-consumer is swapped from its in-tree `SharedMemoryPool` to Tessera
-Pool, the Certus parquet-content hash must remain identical — that
+The two baselines test complementary contracts. When the downstream
+consumer is swapped from its in-tree shared-memory pool to Tessera
+Pool, the downstream parquet-content hash must remain identical — that
 swap relies on the byte-faithfulness this baseline pins.

@@ -347,7 +347,8 @@ impl Pool {
     /// The generation re-check detects it after the fact, but the
     /// unsynchronized cross-process `memcpy` itself is a data race. This
     /// matches (and exceeds, via the stale-detection) the prior in-tree
-    /// `SharedMemoryPool`, which had no generation check at all. A
+    /// shared-memory pool it replaces, which had no generation check at
+    /// all. A
     /// race-free arbitrary-concurrent copy needs an in-SHM robust
     /// per-slot lock — tracked for v0.2 (see
     /// `docs/issue_facade_thread_safety.md`).

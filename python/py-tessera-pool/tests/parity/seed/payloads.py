@@ -5,8 +5,8 @@ fixed set of payloads at edge sizes. Each payload is constructed
 deterministically from a seed string + a known length so the bytes are
 byte-identical across runs without any random-state dependency.
 
-This is the *primitive-level* baseline. Downstream consumers (e.g. the
-Certus ``ParquetWorkerPool`` that sits on top of Pool) have their own
+This is the *primitive-level* baseline. Downstream consumers (e.g. a
+downstream parquet worker pool that sits on top of Pool) have their own
 parity tests in the consumer repo with a different seed shape (Arrow
 records → Parquet). Both layers pinning their own canonical hash is
 the equivalence gate for the eventual in-tree → tessera swap.

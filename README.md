@@ -10,8 +10,9 @@ Tessera is a Rust workspace with thin Python facades for shared-memory IPC:
 
 > **Status: pre-v0.1.** The Rust cores, PyO3 facades, examples, and Sink worker
 > binary are implemented, but Tessera is not published yet. The v0.1.0 release
-> is gated on re-importing these packages into Certus and validating them in the
-> production pipeline. Until that gate passes, expect API and contract churn.
+> is gated on re-importing these packages into the downstream pipeline and
+> validating them in production. Until that gate passes, expect API and
+> contract churn.
 
 A *tessera* is a small tile in a mosaic. In this library, the "tiles" are
 shared-memory slots and descriptors: producers put bytes in a region, pass a
@@ -174,19 +175,21 @@ For complete runnable demos, see [`examples/`](examples/).
 | Slate Rust core (`tessera-slate`) | implemented |
 | Slate as Auspice's metrics board (typed layer over `tessera-slate`) | validated — cross-language Python↔Rust, exact record/replay round-trip, headless read |
 | Slate PyO3 facade | planned |
-| Certus re-import and production validation | next gate |
-| crates.io / PyPI release | deferred until the Certus gate passes |
+| Downstream re-import and production validation | next gate |
+| crates.io / PyPI release | deferred until the downstream gate passes |
 
 Both Tessera surfaces Auspice consumes — `tessera-ring` (the log/telemetry
 stream) and `tessera-slate` (the metrics snapshot, via Auspice's typed board
 layer) — are now the live backing for the Auspice TUI, not just a sample
-integration. They have been exercised end-to-end three ways: a cross-language
+integration. They have been exercised end-to-end four ways: a cross-language
 Python↔Rust harness (Python writer → Slate board + Ring logs → Rust reader); an
 **exact record/replay round-trip** of the Slate board (a recorded board
 timeline replays into a fresh Slate region with every slot value reproduced);
-and **headless rendering** that reads the board with no terminal attached. They
-are stable for that consumed path; the remaining v0.1 gate above concerns the
-broader Certus re-import.
+**headless rendering** that reads the board with no terminal attached; and a
+**live multi-model GPU training run** that now drives both consumed planes
+(`tessera-ring` + `tessera-slate`) in production, reported successful so far.
+They are stable for that consumed path; the remaining v0.1 gate above concerns
+the broader downstream re-import.
 
 ## Workspace Layout
 
@@ -255,7 +258,7 @@ option.
 
 ## Acknowledgments
 
-Tessera was extracted from the Certus multi-process and telemetry tooling. The
-single-owner lifecycle, lease-generation validation, owner-held Sink leases,
-caller-supplied Ring sections, and parity-test approach all came from that
-production extraction path.
+Tessera was extracted from a downstream multi-process and telemetry tooling
+codebase. The single-owner lifecycle, lease-generation validation, owner-held
+Sink leases, caller-supplied Ring sections, and parity-test approach all came
+from that production extraction path.

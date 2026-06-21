@@ -8,7 +8,7 @@ version = "0.0.1"
 description = "Lossy mmap-backed multi-writer / multi-reader ring buffer (Tessera Ring)"
 readme = "README.md"
 license = { text = "MIT OR Apache-2.0" }
-authors = [{ name = "Indubitable Industries" }]
+authors = [{ name = "Auspex Labs" }]
 requires-python = ">=3.10"
 classifiers = [
     "Development Status :: 1 - Planning",

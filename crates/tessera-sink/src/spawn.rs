@@ -185,9 +185,9 @@ mod tests {
 
     fn params() -> WorkerParams {
         WorkerParams {
-            pool_description: "certus/artifacts/pool".into(),
-            control_description: "certus/artifacts/control/2".into(),
-            ack_description: "certus/artifacts/ack".into(),
+            pool_description: "app/artifacts/pool".into(),
+            control_description: "app/artifacts/control/2".into(),
+            ack_description: "app/artifacts/ack".into(),
             pool_slot_count: 8,
             pool_slot_size_bytes: 65536,
             control_slot_count: 64,

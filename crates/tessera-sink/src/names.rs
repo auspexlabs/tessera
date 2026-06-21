@@ -27,11 +27,11 @@ mod tests {
 
     #[test]
     fn derivations_are_distinct_and_stable() {
-        let base = "certus/artifacts";
-        assert_eq!(pool(base), "certus/artifacts/pool");
-        assert_eq!(ack(base), "certus/artifacts/ack");
-        assert_eq!(control(base, 0), "certus/artifacts/control/0");
-        assert_eq!(control(base, 3), "certus/artifacts/control/3");
+        let base = "app/artifacts";
+        assert_eq!(pool(base), "app/artifacts/pool");
+        assert_eq!(ack(base), "app/artifacts/ack");
+        assert_eq!(control(base, 0), "app/artifacts/control/0");
+        assert_eq!(control(base, 3), "app/artifacts/control/3");
         // All four are distinct so their BLAKE3 handles never collide.
         let all = [pool(base), ack(base), control(base, 0), control(base, 1)];
         for (i, a) in all.iter().enumerate() {

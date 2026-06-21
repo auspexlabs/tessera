@@ -85,15 +85,15 @@ Pool slot. `fsync` is per-submit and defaults off.
 
 ### Tid-bits on each
 
-**Heartbeat** — Bayence ships one (`HeartbeatShm` in
-`bayence/telemetry/writer_pool.py`, ~50 LOC: a small SHM of u64
-timestamps per writer; the pool's monitor thread reads them every
-second and restarts stale writers). The pattern fits inside a Sink
+**Heartbeat** — a downstream consumer ships one as the telemetry
+heartbeat of its writer pool (~50 LOC: a small SHM of u64 timestamps
+per writer; the pool's monitor thread reads them every second and
+restarts stale writers). The pattern fits inside a Sink
 implementation; promoting it to a top-level Tessera primitive would
 be premature — most consumers don't need it.
 
 **Barrier / latch** — useful for ML training start-of-step sync,
-coordinated rolling restart of worker groups. The Bayence training
+coordinated rolling restart of worker groups. A downstream training
 loop has a barrier-like construct over multiprocessing.Event. Easy to
 build atop Channel once Channel exists.
 

@@ -24,10 +24,11 @@ process-private lock cannot prevent.
 
 Rationale for deferring:
 - **Parity-plus.** This is exactly the exposure the prior in-tree
-  `certus/mp/shared_memory_pool.py` had — with *less* protection (it had no
-  generation check at all). Certus shipped on it for the whole project because
-  its protocol (owner holds the lease until the worker acks; reclaim is
-  crash-recovery only, for dead readers) means the race never occurs.
+  shared-memory pool of the downstream consumer had — with *less* protection
+  (it had no generation check at all). The downstream shipped on it for the
+  whole project because its protocol (owner holds the lease until the worker
+  acks; reclaim is crash-recovery only, for dead readers) means the race never
+  occurs.
 - The contract `read_payload` documents (single-writer-lease) forbids the
   triggering scenario, so v0.1 is sound *for the use Tessera is built for*.
 - A genuinely race-free arbitrary-concurrent cross-process copy needs an
@@ -92,8 +93,8 @@ creating thread and PyO3 panics if touched from another:
 PanicException: tessera_pool::PyPool is unsendable, but sent to another thread
 ```
 
-The first consumer (Certus' `ParquetWorkerPool`) is an ordinary async service:
-Pool **created** on the event-loop thread, **used** from a `run_in_executor`
+The first consumer (a downstream parquet worker pool) is an ordinary async
+service: Pool **created** on the event-loop thread, **used** from a `run_in_executor`
 thread, **stopped** from an `asyncio.to_thread` thread, leases **released** from
 an internal collector thread. A drop-in swap panics. For owner/authority roles
 there is only one instance, so "one handle per thread" is not available there.
