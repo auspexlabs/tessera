@@ -6,10 +6,31 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    # Routine minor/patch bumps arrive as one PR; majors stay individual
+    # so each breaking change is reviewed (and CI-gated) on its own.
+    groups:
+      cargo-minor-patch:
+        update-types:
+          - minor
+          - patch
+    ignore:
+      # Pinned to 0.22.x deliberately: the py-tessera-* facades use pyo3's
+      # `_bound` API and the `gil-refs` cfg, both removed in 0.23+. Upgrading
+      # pyo3 is a deliberate migration, not an auto-bump. Patch updates within
+      # 0.22.x still flow.
+      - dependency-name: pyo3
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-major
 
-  # The actions pinned in .github/workflows.
+  # The actions pinned in .github/workflows. Low-risk and CI-gated, so
+  # batch them all into a single PR.
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    groups:
+      github-actions:
+        patterns:
+          - "*"
