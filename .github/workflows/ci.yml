@@ -51,6 +51,11 @@ jobs:
         run: pip install maturin pytest
       - name: build wheel
         run: maturin build --release --out dist --manifest-path python/${{ matrix.package }}/Cargo.toml
+      # Sink's tests spawn the real tessera-sink-worker subprocess; build it
+      # (debug — where the tests look) so they run instead of skipping.
+      - name: build sink worker (sink integration tests)
+        if: matrix.package == 'py-tessera-sink'
+        run: cargo build -p tessera-sink-worker
       # Install the built wheel and run the facade's cross-language pytest
       # suite against it — the build alone never exercised the bindings.
       - name: install wheel + run tests

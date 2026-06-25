@@ -19,9 +19,6 @@ classifiers = [
     "Programming Language :: Rust",
     "Topic :: Software Development :: Libraries",
 ]
-dependencies = [
-    "tessera-pool>=0.0.1",
-]
 
 [project.urls]
 Repository = "https://github.com/Auspex-Aerie/tessera"
