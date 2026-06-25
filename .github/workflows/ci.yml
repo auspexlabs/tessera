@@ -6,25 +6,40 @@ on:
   pull_request:
     branches: [main]
 
+# A newer push to the same branch / PR cancels in-flight runs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  cargo-check:
-    name: cargo check + test (workspace)
+  rust:
+    name: clippy + test (workspace)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: cargo check
-        run: cargo check --workspace --all-targets
-      - name: cargo test
+      # clippy compiles every target, so it subsumes `cargo check`; `-D
+      # warnings` makes any lint a hard failure (the workspace is clean).
+      - name: clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: test
         run: cargo test --workspace --all-targets
 
-  python-build:
-    name: maturin build (Python facades)
+  python:
+    name: build + test facade
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        package: [py-tessera-pool, py-tessera-ring, py-tessera-sink]
+        package:
+          - py-tessera-pool
+          - py-tessera-ring
+          - py-tessera-channel
+          - py-tessera-sink
+          - py-tessera-slate
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -32,8 +47,20 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: install maturin
-        run: pip install maturin
-      - name: maturin build
-        working-directory: python/${{ matrix.package }}
-        run: maturin build --release
+      - name: install maturin + test deps
+        # syrupy backs py-tessera-pool's parity snapshot suite (declared in
+        # its [test] extra); harmless to install for the other facades.
+        run: pip install maturin pytest syrupy
+      - name: build wheel
+        run: maturin build --release --out dist --manifest-path python/${{ matrix.package }}/Cargo.toml
+      # Sink's tests spawn the real tessera-sink-worker subprocess; build it
+      # (debug — where the tests look) so they run instead of skipping.
+      - name: build sink worker (sink integration tests)
+        if: matrix.package == 'py-tessera-sink'
+        run: cargo build -p tessera-sink-worker
+      # Install the built wheel and run the facade's cross-language pytest
+      # suite against it — the build alone never exercised the bindings.
+      - name: install wheel + run tests
+        run: |
+          pip install dist/*.whl
+          python -m pytest python/${{ matrix.package }}/tests -q

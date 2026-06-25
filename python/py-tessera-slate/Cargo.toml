@@ -1,6 +1,6 @@
 [package]
-name = "py-tessera-ring"
-description = "Python bindings for tessera-ring (Tessera Ring)"
+name = "py-tessera-slate"
+description = "Python bindings for tessera-slate (Tessera Slate)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,13 +9,13 @@ authors.workspace = true
 rust-version.workspace = true
 
 [lib]
-name = "tessera_ring"
+name = "tessera_slate"
 crate-type = ["cdylib"]
 
 [dependencies]
 parking_lot = "0.12"
 pyo3 = { workspace = true }
-tessera-ring = { workspace = true }
+tessera-slate = { workspace = true }
 
 [lints.rust]
 # pyo3 0.22's `create_exception!` expands a `cfg(feature = "gil-refs")`

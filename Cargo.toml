@@ -11,6 +11,7 @@ members = [
     "python/py-tessera-ring",
     "python/py-tessera-channel",
     "python/py-tessera-sink",
+    "python/py-tessera-slate",
 ]
 
 [workspace.package]

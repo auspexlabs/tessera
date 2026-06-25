@@ -9,6 +9,13 @@
 //! The facade owns ergonomics only — every data operation delegates
 //! to the Rust core. No serialization happens in Python.
 
+// pyo3 0.22's `#[pymethods]`/`#[pyfunction]` expansion injects an
+// identity `PyErr: From<PyErr>` conversion that clippy reports as
+// `useless_conversion` against our return-type spans. There is no
+// literal `.into()` in this file to remove — the conversion is
+// macro-generated. Suppress the false positive crate-wide.
+#![allow(clippy::useless_conversion)]
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -101,6 +108,8 @@ impl PyLease {
     }
 
     /// Picklable via `(_lease_from_bytes, (slot_index, generation, lease_id_bytes))`.
+    // The tuple is the pickle `__reduce__` contract: (callable, args).
+    #[allow(clippy::type_complexity)]
     fn __reduce__<'py>(
         &self,
         py: Python<'py>,
@@ -171,6 +180,8 @@ impl PyDescriptor {
     /// Picklable via `(_descriptor_from_bytes, (slot_index, generation, lease_id_bytes, size_bytes))`.
     /// This is the canonical IPC handoff path: send a Descriptor through a
     /// multiprocessing.Queue / Pipe; pickle reconstructs it on the worker side.
+    // The tuple is the pickle `__reduce__` contract: (callable, args).
+    #[allow(clippy::type_complexity)]
     fn __reduce__<'py>(
         &self,
         py: Python<'py>,

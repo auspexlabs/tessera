@@ -13,9 +13,11 @@ use shared_memory::{Shmem, ShmemConf, ShmemError};
 
 use crate::error::{Result, TesseraPoolError};
 use crate::header::{
-    flags, region_size_bytes, slot_meta_offset, slot_payload_offset, Header, SlotMeta,
-    FORMAT_VERSION, MAGIC,
+    region_size_bytes, slot_meta_offset, slot_payload_offset, Header, SlotMeta, FORMAT_VERSION,
+    MAGIC,
 };
+#[cfg(test)]
+use crate::header::flags;
 use crate::namespace::NamespaceHandle;
 
 /// One mapped Tessera Pool region. Owns the `Shmem` handle so the

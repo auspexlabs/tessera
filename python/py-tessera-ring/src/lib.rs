@@ -11,6 +11,13 @@
 //! The facade owns ergonomics only — every data operation delegates
 //! to the Rust core. No serialization happens in Python.
 
+// pyo3 0.22's `#[pymethods]`/`#[pyfunction]` expansion injects an
+// identity `PyErr: From<PyErr>` conversion that clippy reports as
+// `useless_conversion` against our return-type spans. There is no
+// literal `.into()` in this file to remove — the conversion is
+// macro-generated. Suppress the false positive crate-wide.
+#![allow(clippy::useless_conversion)]
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -94,6 +101,8 @@ impl PyEvent {
     }
 
     /// Picklable via `(_event_from_parts, (section_id, position, ts_ns, payload))`.
+    // The tuple is the pickle `__reduce__` contract: (callable, args).
+    #[allow(clippy::type_complexity)]
     fn __reduce__<'py>(
         &self,
         py: Python<'py>,

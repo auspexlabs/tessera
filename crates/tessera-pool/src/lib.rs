@@ -60,7 +60,7 @@ impl LeaseId {
 impl core::fmt::Display for LeaseId {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         for byte in self.to_bytes() {
-            write!(f, "{:02x}", byte)?;
+            write!(f, "{byte:02x}")?;
         }
         Ok(())
     }

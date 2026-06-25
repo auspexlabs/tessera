@@ -226,7 +226,7 @@ fn handle_chunk(
 ) -> Result<()> {
     let bytes = pool.read_payload(descriptor)?;
 
-    if !jobs.contains_key(&job_id) {
+    if let std::collections::hash_map::Entry::Vacant(e) = jobs.entry(job_id) {
         // First chunk of a job must be index 0. Anything else means we
         // already dropped this job's state after an earlier failure.
         if chunk_index != 0 {
@@ -238,16 +238,13 @@ fn handle_chunk(
         let final_path = PathBuf::from(path);
         let temp_path = temp_path_for(&final_path, job_id)?;
         let file = File::create(&temp_path)?;
-        jobs.insert(
-            job_id,
-            WorkerJob {
-                final_path,
-                temp_path,
-                file,
-                hasher: blake3::Hasher::new(),
-                next_chunk_index: 0,
-            },
-        );
+        e.insert(WorkerJob {
+            final_path,
+            temp_path,
+            file,
+            hasher: blake3::Hasher::new(),
+            next_chunk_index: 0,
+        });
     }
 
     let job = jobs.get_mut(&job_id).expect("inserted above");

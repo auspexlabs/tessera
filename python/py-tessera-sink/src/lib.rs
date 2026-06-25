@@ -16,6 +16,13 @@
 //! Channel facade. Drive a Sink from one Python thread; for parallelism,
 //! the worker *subprocesses* already provide it.
 
+// pyo3 0.22's `#[pymethods]`/`#[pyfunction]` expansion injects an
+// identity `PyErr: From<PyErr>` conversion that clippy reports as
+// `useless_conversion` against our return-type spans. There is no
+// literal `.into()` in this file to remove — the conversion is
+// macro-generated. Suppress the false positive crate-wide.
+#![allow(clippy::useless_conversion)]
+
 use std::path::PathBuf;
 
 use parking_lot::Mutex;
@@ -70,7 +77,7 @@ impl PySink {
         let sink = guard
             .as_mut()
             .ok_or_else(|| TesseraSinkError::new_err("Sink is closed"))?;
-        op(&mut **sink).map_err(map_err)
+        op(sink).map_err(map_err)
     }
 }
 

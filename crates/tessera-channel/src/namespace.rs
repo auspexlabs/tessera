@@ -31,7 +31,7 @@ impl NamespaceHandle {
         let mut h = Hasher::new();
         h.update(description.as_bytes());
         let full = h.finalize();
-        let full_digest: [u8; 32] = (*full.as_bytes()).into();
+        let full_digest: [u8; 32] = *full.as_bytes();
         let mut digest_prefix = [0u8; 16];
         digest_prefix.copy_from_slice(&full_digest[..16]);
         Self {
@@ -51,7 +51,7 @@ impl NamespaceHandle {
         for byte in &self.digest_prefix {
             use core::fmt::Write;
             // Safe: writing to a String. Unwrap is unreachable.
-            write!(&mut out, "{:02x}", byte).unwrap();
+            write!(&mut out, "{byte:02x}").unwrap();
         }
         out
     }

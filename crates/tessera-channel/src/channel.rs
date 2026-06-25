@@ -84,6 +84,12 @@ impl Channel {
     /// Open a Channel per the config: BLAKE3-derive the namespace
     /// handle, then either create (Receiver) or attach (Sender) the
     /// SHM region.
+    // `Arc<Region>` wraps a `!Send`/`!Sync` `Shmem`, but `Channel` is
+    // deliberately `Send + Sync` via the audited `unsafe impl`s above:
+    // the mmap is valid from any thread, sends are CAS-synchronized,
+    // and recv is serialized by `recv_lock`. The Arc IS shared across
+    // threads, so clippy's `Rc` suggestion would be incorrect.
+    #[allow(clippy::arc_with_non_send_sync)]
     pub fn open(config: ChannelConfig) -> Result<Self> {
         let handle = NamespaceHandle::derive(&config.description);
         let region = match config.role {

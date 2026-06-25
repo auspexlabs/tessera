@@ -3,9 +3,9 @@ requires = ["maturin>=1.5,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "tessera-sink"
+name = "tessera-slate"
 version = "0.0.1"
-description = "Atomic-write worker pool to disk, built on tessera-pool (Tessera Sink)"
+description = "Seqlock-protected latest-value snapshot slot table (Tessera Slate)"
 readme = "README.md"
 license = { text = "MIT OR Apache-2.0" }
 authors = [{ name = "Auspex Labs" }]
@@ -24,6 +24,6 @@ classifiers = [
 Repository = "https://github.com/Auspex-Aerie/tessera"
 
 [tool.maturin]
-module-name = "tessera_sink._native"
+module-name = "tessera_slate._native"
 python-source = "python"
 features = ["pyo3/extension-module"]

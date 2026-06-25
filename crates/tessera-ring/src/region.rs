@@ -64,8 +64,8 @@ pub struct Region {
     /// owner can't race a successor's freshly-created region with the
     /// same name. Mirrors the three-part Pool fix from PR #4 (iter-1
     /// commit b18b95a, iter-3 commit 3987833, iter-4 commit 3baf46d).
-    /// Without this flag — and the matching `Shmem::set_owner(false)`
-    /// + return-code-gated state mutation — A's second unlink or
+    /// Without this flag — and the matching `Shmem::set_owner(false)` +
+    /// return-code-gated state mutation — A's second unlink or
     /// drop-time unlink would clobber B's name after a handoff.
     manually_unlinked: bool,
 }
@@ -601,8 +601,8 @@ impl Region {
 
     /// Byte offset of `writer_position` within `SectionHeader`.
     ///
-    /// Layout: section_id(4) + slot_count(4) + slot_size_bytes(4)
-    /// + _pad0(4) = 16 bytes. The test
+    /// Layout: section_id(4) + slot_count(4) + slot_size_bytes(4) +
+    /// _pad0(4) = 16 bytes. The test
     /// `writer_position_field_offset_matches_layout` locks this in.
     const WRITER_POSITION_FIELD_OFFSET: usize = 16;
 

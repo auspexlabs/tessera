@@ -24,9 +24,10 @@ use shared_memory::{Shmem, ShmemConf, ShmemError};
 
 use crate::error::{Result, TesseraChannelError};
 use crate::header::{
-    region_size_bytes, slot_header_offset, slot_payload_offset, slot_stride, Header, SlotHeader,
-    FORMAT_VERSION, MAGIC,
+    region_size_bytes, slot_header_offset, slot_payload_offset, Header, FORMAT_VERSION, MAGIC,
 };
+#[cfg(test)]
+use crate::header::SlotHeader;
 use crate::namespace::NamespaceHandle;
 
 /// One mapped Tessera Channel region. Owns the `Shmem` handle so

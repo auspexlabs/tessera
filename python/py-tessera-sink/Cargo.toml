@@ -17,3 +17,8 @@ pyo3 = { workspace = true }
 parking_lot = "0.12"
 tessera-sink = { workspace = true }
 tessera-pool = { workspace = true }
+
+[lints.rust]
+# pyo3 0.22's `create_exception!` expands a `cfg(feature = "gil-refs")`
+# arm we never enable; declare it known so check-cfg stays quiet.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("gil-refs"))'] }
