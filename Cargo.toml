@@ -32,4 +32,4 @@ tessera-slate = { path = "crates/tessera-slate", version = "0.0.1" }
 
 # Shared third-party
 blake3 = "1.5"
-pyo3 = { version = "0.22", features = ["extension-module"] }
+pyo3 = { version = "0.29", features = ["extension-module"] }
