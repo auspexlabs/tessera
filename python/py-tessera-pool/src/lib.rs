@@ -147,6 +147,19 @@ struct PyDescriptor {
 
 #[pymethods]
 impl PyDescriptor {
+    /// Reconstruct a Descriptor from its parts — the cross-language / cross-process handoff path for when
+    /// the producer is not a Python `Pool.write` (e.g. a Rust producer hands the slot reference to a Python
+    /// consumer over a byte channel). `lease_id_bytes` is the 16-byte lease id (also exposed as `lease_id_hex`).
+    #[new]
+    fn new(slot_index: u32, generation: u64, lease_id_bytes: &[u8], size_bytes: u32) -> PyResult<Self> {
+        let bytes: [u8; 16] = lease_id_bytes
+            .try_into()
+            .map_err(|_| pyo3::exceptions::PyValueError::new_err("lease_id_bytes must be 16 bytes"))?;
+        Ok(PyDescriptor {
+            inner: RustDescriptor::new(slot_index, LeaseId::from_bytes(bytes), generation, size_bytes),
+        })
+    }
+
     #[getter]
     fn slot_index(&self) -> u32 {
         self.inner.slot_index()
